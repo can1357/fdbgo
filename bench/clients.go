@@ -1,5 +1,9 @@
 package main
 
+// #define FDB_API_VERSION 730
+// #include <foundationdb/fdb_c.h>
+import "C"
+
 import (
 	"context"
 
@@ -19,7 +23,11 @@ func openKV(c config) (kv, error) {
 		db, err := fdb.Open(c.cluster)
 		return fdbgoKV{db}, err
 	}
-	cfdb.MustAPIVersion(740)
+	// build.sh pairs the Go wrapper with the installed SDK; use the highest
+	// runtime API supported by that SDK, capped at the versions we exercise.
+	if err := cfdb.APIVersion(min(740, int(C.fdb_get_max_api_version()))); err != nil {
+		return nil, err
+	}
 	db, err := cfdb.OpenDatabase(c.cluster)
 	return cgoKV{db}, err
 }

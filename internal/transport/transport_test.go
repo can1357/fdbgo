@@ -201,20 +201,6 @@ func TestRemoteErrorAndNotices(t *testing.T) {
 
 func TestHandshakeFailures(t *testing.T) {
 	fs := newFakeServer(t, testHandler)
-	fs.version = 0x0FDB00B073000000 | objectSerializerFlag
-	fs.start()
-	if _, err := Connect(context.Background(), fs.addr()); err != Incompatible {
-		t.Fatalf("old protocol: got %v", err)
-	}
-
-	fs = newFakeServer(t, testHandler)
-	fs.version = ProtocolVersion | objectSerializerFlag | 0x1234 // patch bits may differ
-	fs.start()
-	if _, err := Connect(context.Background(), fs.addr()); err != nil {
-		t.Fatalf("patch version difference: %v", err)
-	}
-
-	fs = newFakeServer(t, testHandler)
 	fs.connectLen = 4
 	fs.start()
 	if _, err := Connect(context.Background(), fs.addr()); err != Malformed {
@@ -399,7 +385,7 @@ func TestMonitorFailsSilentPeer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client, server := net.Pipe()
 		go pipeServer(server, false)
-		c := start(wire.NetAddr{}, client, client, true)
+		c := start(wire.NetAddr{}, client, client, true, wire.Protocol74)
 		time.Sleep(2900 * time.Millisecond)
 		synctest.Wait()
 		if c.IsDead() {
@@ -418,7 +404,7 @@ func TestMonitorClosesIdleConnection(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client, server := net.Pipe()
 		go pipeServer(server, true)
-		c := start(wire.NetAddr{}, client, client, true)
+		c := start(wire.NetAddr{}, client, client, true, wire.Protocol74)
 		if err := call(c, echoTok); err != nil {
 			t.Fatal(err)
 		}
@@ -440,7 +426,7 @@ func TestMonitorKeepsBusyConnection(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client, server := net.Pipe()
 		go pipeServer(server, true)
-		c := start(wire.NetAddr{}, client, client, true)
+		c := start(wire.NetAddr{}, client, client, true, wire.Protocol74)
 		for range 30 {
 			time.Sleep(10 * time.Second)
 			if err := call(c, echoTok); err != nil {

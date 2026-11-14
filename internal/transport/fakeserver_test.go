@@ -26,9 +26,10 @@ type fakeServer struct {
 	tlsConfig  *tls.Config
 	handle     func(s *serverConn, dest wire.UID, msg []byte)
 
-	mu    sync.Mutex
-	conns []*serverConn
-	wg    sync.WaitGroup
+	mu     sync.Mutex
+	conns  []*serverConn
+	hellos []uint64
+	wg     sync.WaitGroup
 }
 
 // serverConn is one accepted connection of a fakeServer.
@@ -53,7 +54,7 @@ func newFakeServer(t testing.TB, handle func(s *serverConn, dest wire.UID, msg [
 	if handle == nil {
 		handle = answerPings
 	}
-	fs := &fakeServer{ln: ln, version: ProtocolVersion | objectSerializerFlag, connectLen: connectPacketLen, handle: handle}
+	fs := &fakeServer{ln: ln, version: uint64(wire.Protocol74) | objectSerializerFlag, connectLen: connectPacketLen, handle: handle}
 	t.Cleanup(fs.close)
 	return fs
 }
@@ -113,10 +114,20 @@ func (fs *fakeServer) serve(nc net.Conn) {
 	if _, err := io.ReadFull(s.r, hello[:]); err != nil {
 		return
 	}
+	advertised := binary.LittleEndian.Uint64(hello[4:])
+	fs.mu.Lock()
+	version := fs.version
+	fs.hellos = append(fs.hellos, advertised)
+	fs.mu.Unlock()
 	reply := make([]byte, 4+int(max(fs.connectLen, 8)))
 	binary.LittleEndian.PutUint32(reply[0:], fs.connectLen)
-	binary.LittleEndian.PutUint64(reply[4:], fs.version)
+	binary.LittleEndian.PutUint64(reply[4:], version)
 	if _, err := nc.Write(reply); err != nil {
+		return
+	}
+	// A real FlowTransport peer never accepts ordinary RPCs after an
+	// incompatible initial advertisement, even if the client changes codecs.
+	if advertised&objectSerializerFlag == 0 || !wire.ProtocolVersion(advertised).Compatible(wire.ProtocolVersion(version)) {
 		return
 	}
 	hdrLen := 4

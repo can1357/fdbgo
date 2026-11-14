@@ -8,23 +8,24 @@
 #   scripts/bindingtester.sh <args...>      passes <args...> to bindingtester.py
 #
 # bindingtester.py clears the whole database before every test, so the default is a private
-# cluster (run/bt, port 4800) that this script starts with scripts/cluster.sh when it is not
-# running; never point FDB_CLUSTER_FILE at a shared cluster.
+# cluster (run/bt-<client-version>, port 4800 for 7.3 or 4900 for 7.4) started on demand
+# with scripts/cluster.sh; never point FDB_CLUSTER_FILE at a shared cluster.
 #
 # Environment:
-#   FDB_CLUSTER_FILE  cluster file (default: <repo>/run/bt/fdb.cluster, started on demand)
-#   FDB_SOURCE_DIR    FoundationDB source tree providing bindings/ (read-only, copied)
+#   FDB_ROOT          installation root (default: <repo>/target/fdb); also holds tester work files
+#   FDB_CLUSTER_FILE  cluster file (default: <repo>/run/bt-<client-version>/fdb.cluster)
+#   FDB_API_VERSION   reference API version (default: highest supported by libfdb_c, at most 740)
+#   FDB_BT_PORT       private cluster port (default: 4800 for 7.3, 4900 for 7.4)
+#   FDB_SOURCE_DIR    matching FoundationDB source tree (default: $FDB_ROOT/src; read-only, copied)
 #   FDB_CLIENT_LIB    libfdb_c used by the python reference binding
 #   FDB_CLI           fdbcli used to probe the cluster and enable tenant_mode
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-fdb_source_dir=${FDB_SOURCE_DIR:-$root/target/fdb/src}
-bt_run=$root/run/bt
-bt_port=4800
-default_cluster_file=$bt_run/fdb.cluster
-cluster_file=${FDB_CLUSTER_FILE:-$default_cluster_file}
-work_dir=$root/target/bindingtester
+fdb_root=${FDB_ROOT:-$root/target/fdb}
+fdb_root=$(cd "$fdb_root" && pwd)
+fdb_source_dir=${FDB_SOURCE_DIR:-$fdb_root/src}
+work_dir=$fdb_root/bindingtester
 venv=$work_dir/venv
 pypkg=$work_dir/pypkg
 src=$work_dir/src
@@ -32,14 +33,14 @@ tester_bin=$work_dir/stacktester
 # A go.mod makes target/ its own module, so ./... skips the Go files of the copied bindings.
 mkdir -p "$root/target"
 [[ -f $root/target/go.mod ]] || printf 'module ignored\n' >"$root/target/go.mod"
-api_version=740
+api_version=${FDB_API_VERSION:-}
 
 case "$(uname -s)" in
   Darwin) capi_name=libfdb_c.dylib ;;
   *) capi_name=libfdb_c.so ;;
 esac
-fdb_client_lib=${FDB_CLIENT_LIB:-$root/target/fdb/lib/$capi_name}
-fdb_cli=${FDB_CLI:-$root/target/fdb/bin/fdbcli}
+fdb_client_lib=${FDB_CLIENT_LIB:-$fdb_root/lib/$capi_name}
+fdb_cli=${FDB_CLI:-$fdb_root/bin/fdbcli}
 
 log() { printf '==> %s\n' "$*" >&2; }
 
@@ -52,17 +53,23 @@ setup_python() {
     uv venv --quiet "$venv"
   fi
 
-  fdb_version=$("$venv/bin/python" - "$fdb_client_lib" "$api_version" <<'EOF'
+  local client_info
+  client_info=$("$venv/bin/python" - "$fdb_client_lib" "$api_version" <<'EOF'
 import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1])
+maximum = min(740, lib.fdb_get_max_api_version())
+api = int(sys.argv[2]) if sys.argv[2] else maximum
+if not 23 <= api <= maximum:
+    sys.exit(f"FDB_API_VERSION must be between 23 and {maximum}, got {api}")
 # fdb_get_client_version dereferences the client API, which exists only after API selection.
-if lib.fdb_select_api_version_impl(int(sys.argv[2]), int(sys.argv[2])) != 0:
-    sys.exit("fdb_select_api_version failed")
+if lib.fdb_select_api_version_impl(api, api) != 0:
+    sys.exit(f"fdb_select_api_version failed for API {api}")
 lib.fdb_get_client_version.restype = ctypes.c_char_p
-print(lib.fdb_get_client_version().decode().split(",")[0])
+print(lib.fdb_get_client_version().decode().split(",")[0], api, maximum)
 EOF
 )
-  log "libfdb_c version $fdb_version"
+  read -r fdb_version api_version max_api_version <<< "$client_info"
+  log "libfdb_c version $fdb_version, API $api_version"
   if [[ ! -d "$pypkg/foundationdb-$fdb_version.dist-info" ]]; then
     rm -rf "$pypkg"
     uv pip install --quiet --python "$venv/bin/python" --target "$pypkg" "foundationdb==$fdb_version"
@@ -100,7 +107,7 @@ setup_cluster() {
     ! { [[ -f "$cluster_file" ]] && "$fdb_cli" -C "$cluster_file" --timeout 5 --exec "status minimal" 2>/dev/null |
       grep -q "available"; }; then
     log "starting private cluster in $bt_run (port $bt_port)"
-    FDB_PORT=$bt_port FDB_RUN=$bt_run "$root/scripts/cluster.sh" up 1 memory
+    FDB_BIN="$fdb_root/bin" FDB_PORT=$bt_port FDB_RUN=$bt_run "$root/scripts/cluster.sh" up 1 memory
   fi
   local tenant_mode
   tenant_mode=$(cli "status json" |
@@ -166,6 +173,10 @@ mode=${1:-quick}
 setup_python
 setup_sources
 [[ "$mode" == setup ]] && exit 0
+bt_run=$root/run/bt-$fdb_version
+bt_port=${FDB_BT_PORT:-$((4800 + (max_api_version - 730) * 10))}
+default_cluster_file=$bt_run/fdb.cluster
+cluster_file=${FDB_CLUSTER_FILE:-$default_cluster_file}
 setup_cluster
 build_tester
 case "$mode" in

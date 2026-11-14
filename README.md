@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/can1357/fdbgo/actions/workflows/ci.yml/badge.svg)](https://github.com/can1357/fdbgo/actions/workflows/ci.yml)
 
-A pure-Go client for FoundationDB 7.4. Connects directly to the cluster—no cgo, `libfdb_c`, or network-thread setup required.
+A pure-Go client for FoundationDB 7.3 and 7.4. Connects directly to the cluster—no cgo, `libfdb_c`, or network-thread setup required.
 
 Includes transactions, read-your-writes, snapshot reads, range scans, atomic mutations, watches, TLS, and the tuple, subspace, and directory layers.
 
 ## Install
 
-Requires **Go 1.27+** and a **FoundationDB 7.4** cluster. The client implements API version 740.
+Requires **Go 1.27+** and a **FoundationDB 7.3 or 7.4** cluster. Protocol selection is automatic and independent for each connection; one process can use both releases. The Go API retains its API-740 semantics without a version-selection call.
 
 ```sh
 go get github.com/can1357/fdbgo@v0.1.1
@@ -93,7 +93,11 @@ The [`bench`](bench) module and [`scripts/bench.sh`](scripts/bench.sh) provide t
 
 ## Limitations
 
-Only FoundationDB 7.4 and API version 740 are supported. Unsupported features include tenants, configuration-database transactions, special-key writes and management modules, blob granules, client trace files, knobs, and the multi-version client.
+Wire protocols for FoundationDB 7.3 and 7.4 are supported; unknown protocols are rejected. Connections renegotiate after a server restart or upgrade, and database handles remain usable across a 7.3 → 7.4 upgrade. Transaction retry and commit-uncertainty rules still apply: use `Transact` and keep callbacks safe to repeat.
+
+Unlike the official multi-version client, fdbgo does not load version-specific C libraries. Both supported protocols use the same client-facing RPC layouts. A future incompatible protocol requires a client update.
+
+Unsupported features include tenants, configuration-database transactions, special-key writes and management modules, blob granules, client trace files, and knobs.
 
 ## Development
 
@@ -106,13 +110,20 @@ go generate ./fdb
 FDB_CLUSTER_FILE=/path/to/fdb.cluster go test -race ./...
 ```
 
-Integration tests skip when `FDB_CLUSTER_FILE` is unset. CI runs race-enabled tests and vet on Linux and macOS, plus live-cluster tests and comparisons with the official Python binding on Linux.
+Integration tests skip when `FDB_CLUSTER_FILE` is unset. CI runs race-enabled tests and vet on Linux and macOS, plus live-cluster tests and reference-binding comparisons against **7.3.81 and 7.4.8** on Linux. An isolated persisted-data upgrade test covers concurrent transactions, watches, and snapshot conflicts while the same database handle reconnects from 7.3 to 7.4.
 
-- [`scripts/fetch-fdb.sh`](scripts/fetch-fdb.sh) downloads FoundationDB 7.4.8 binaries and sources for macOS arm64.
+```sh
+FDB_UPGRADE_FROM=/path/to/fdb-7.3 FDB_UPGRADE_TO=/path/to/fdb-7.4 \
+  go test -race ./fdb -run '^TestMultiVersionUpgrade$'
+```
+
+Each upgrade path is an SDK root containing `bin/fdbserver` and `bin/fdbcli`; the test creates its own clusters.
+
+- [`scripts/fetch-fdb.sh`](scripts/fetch-fdb.sh) downloads matching binaries and sources for macOS arm64 (default 7.4.8). For a side-by-side 7.3 installation: `FDB_ROOT=target/fdb-7.3.81 scripts/fetch-fdb.sh 7.3.81`.
 - [`scripts/cluster.sh`](scripts/cluster.sh) manages a local test cluster.
 - [`scripts/bindingtester.sh quick`](scripts/bindingtester.sh) runs the reference-binding checks and requires `uv`. It uses a private cluster by default. **These tests clear the database; never use a shared cluster.**
 
-Scripts default to `target/fdb`. Set `FDB_BIN`, `FDB_SOURCE_DIR`, `FDB_CLIENT_LIB`, or `FDB_ROOT` to use an existing installation.
+Scripts default to `target/fdb`. Set `FDB_ROOT` for fetching, reference tests, and benchmark builds; set `FDB_BIN=$FDB_ROOT/bin` for `cluster.sh`. `FDB_SOURCE_DIR` and `FDB_CLIENT_LIB` can override the matching reference sources and library. Reference tests and C benchmarks select the installed SDK's supported API version automatically.
 
 ## License
 

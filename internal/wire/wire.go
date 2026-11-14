@@ -1,10 +1,20 @@
 package wire
 
-// FDB 7.4 RPC messages: encoders for the requests a client sends and decoders
+// FDB 7.3/7.4 RPC messages: encoders for the requests a client sends and decoders
 // for the replies it receives. Each layout follows the serializer() field
-// order of the same-named FoundationDB 7.4 message, with slot numbers assigned
+// order of the same-named FoundationDB message, with slot numbers assigned
 // per flat.go: unions take two slots, Arena members none. Fields a client
 // never sets are omitted; Flow's reader default-constructs them.
+//
+// The client-facing ObjectSerializer layouts and file identifiers are identical
+// in upstream 7.3.81 and 7.4.8: CoordinationInterface.h (OpenDatabase),
+// CommitProxyInterface.h (ClientDBInfo, GRV, commit, locations, idempotency
+// expiration), StorageServerInterface.h (reads, watches, metrics, splits), and
+// FlowTransport.actor.cpp (ping and notices). Their nested FDBTypes.h,
+// TagThrottle.actor.h, IdempotencyId.actor.h, TenantInfo.h and network types also
+// share layouts. There is deliberately no protocol branch in these codecs.
+// 7.4 only appends streams beyond the interface offsets we use. Its optional
+// MutationRef checksums do not change the unflagged mutations emitted here.
 
 import (
 	"bytes"

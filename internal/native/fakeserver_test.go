@@ -11,7 +11,6 @@ import (
 
 	"github.com/zeebo/xxh3"
 
-	"github.com/can1357/fdbgo/internal/transport"
 	"github.com/can1357/fdbgo/internal/wire"
 )
 
@@ -89,7 +88,7 @@ func (s *nativeTestServer) serve(nc net.Conn) {
 	}
 	clear(hello[:])
 	binary.LittleEndian.PutUint32(hello[:], 40)
-	binary.LittleEndian.PutUint64(hello[4:], transport.ProtocolVersion|1<<60)
+	binary.LittleEndian.PutUint64(hello[4:], uint64(wire.Protocol74)|1<<60)
 	if _, err := nc.Write(hello[:]); err != nil {
 		return
 	}

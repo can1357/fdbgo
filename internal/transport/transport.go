@@ -35,14 +35,11 @@ import (
 	"github.com/can1357/fdbgo/internal/wire"
 )
 
-// ProtocolVersion is the protocol version of FDB 7.4.
-const ProtocolVersion uint64 = 0x0FDB00B074000000
-
 const (
 	// objectSerializerFlag is set on the wire when messages use the object serializer.
 	objectSerializerFlag uint64 = 0x1000000000000000
-	// compatibleMask selects the version bits that must match between peers (flag bits excluded).
-	compatibleMask uint64 = 0x0FFFFFFFFFFF0000
+	// versionMask strips transport flags while preserving the peer's patch bits.
+	versionMask uint64 = 0x0FFFFFFFFFFFFFFF
 	// connectPacketLen is the ConnectPacket length, excluding the length field itself.
 	connectPacketLen = 40
 	// packetLimit is the largest packet accepted from a peer, matching the server limit.
@@ -167,7 +164,8 @@ type shard struct {
 // Connection is one FlowTransport connection to a server process. It is safe
 // for concurrent use; a failed connection never recovers.
 type Connection struct {
-	addr wire.NetAddr
+	addr     wire.NetAddr
+	protocol wire.ProtocolVersion
 	// raw is the TCP socket, closed to fail the connection; rw carries the
 	// FlowTransport stream (raw, or TLS on top of it).
 	raw net.Conn
@@ -205,10 +203,12 @@ type Connection struct {
 // builders pools message builders for request encoding and framing.
 var builders = sync.Pool{New: func() any { return new(wire.Builder) }}
 
-// Connect dials addr (over TLS for :tls addresses), exchanges connect packets
-// and starts the connection's goroutines. Failures are NotDelivered (no
-// connection, TLS failure, timeout after 5s), Incompatible or Malformed
-// (bad handshake); if ctx ends first its error is returned.
+// Connect dials addr (over TLS for :tls addresses), negotiates a supported
+// protocol and starts the connection's goroutines. It initially advertises
+// 7.4; a supported mismatch closes that socket and redials with the peer's
+// protocol before any requests can be sent. All attempts share a 5s timeout.
+// Failures are NotDelivered (no connection, TLS failure, timeout), Incompatible
+// or Malformed (bad handshake); if ctx ends first its error is returned.
 func Connect(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 	if !addr.TLS && PlaintextDisabled() {
 		slog.Debug("PlainTextConnectionDisabled", "addr", addr.String())
@@ -231,67 +231,87 @@ func Connect(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 
 func dial(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 	var d net.Dialer
-	raw, err := d.DialContext(ctx, "tcp", addr.Addr.String())
-	if err != nil {
-		return nil, NotDelivered
-	}
-	if tc, ok := raw.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
-	// Bound the handshake by ctx: its deadline, or an immediate deadline on cancellation.
-	if dl, ok := ctx.Deadline(); ok {
-		_ = raw.SetDeadline(dl)
-	}
-	stop := context.AfterFunc(ctx, func() { _ = raw.SetDeadline(time.Unix(1, 0)) })
-	rw := raw
-	if addr.TLS {
-		tc, err := tlsConnect(ctx, raw)
+	advertised := wire.Protocol74
+	for {
+		raw, err := d.DialContext(ctx, "tcp", addr.Addr.String())
 		if err != nil {
-			stop()
+			return nil, NotDelivered
+		}
+		if tc, ok := raw.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+		// All attempts use the same deadline, including TLS and protocol discovery.
+		if dl, ok := ctx.Deadline(); ok {
+			_ = raw.SetDeadline(dl)
+		}
+		stop := context.AfterFunc(ctx, func() { _ = raw.SetDeadline(time.Unix(1, 0)) })
+		rw := raw
+		if addr.TLS {
+			tc, err := tlsConnect(ctx, raw)
+			if err != nil {
+				stop()
+				raw.Close()
+				return nil, NotDelivered
+			}
+			rw = tc
+		}
+		peer, err := handshake(rw, advertised)
+		if !stop() {
 			raw.Close()
 			return nil, NotDelivered
 		}
-		rw = tc
-	}
-	err = handshake(rw)
-	if !stop() || err != nil {
-		raw.Close()
-		if err == nil {
-			err = NotDelivered
+		if err != nil {
+			raw.Close()
+			if err == Incompatible && peer.Supported() && !peer.Compatible(advertised) {
+				// FlowTransport marks compatibility from the original ConnectPacket.
+				// Merely accepting a supported peer here would leave it rejecting
+				// our requests. Only a new socket can advertise the matching version.
+				advertised = peer.Normalized()
+				continue
+			}
+			return nil, err
 		}
-		return nil, err
+		_ = raw.SetDeadline(time.Time{})
+		// TLS authenticates packets itself, so FlowTransport sends no checksum.
+		return start(addr, raw, rw, !addr.TLS, peer), nil
 	}
-	_ = raw.SetDeadline(time.Time{})
-	// TLS authenticates packets itself, so FlowTransport sends no checksum.
-	return start(addr, raw, rw, !addr.TLS), nil
 }
 
-// handshake exchanges ConnectPackets and checks protocol compatibility.
-func handshake(rw net.Conn) error {
+// handshake returns the peer's protocol after exchanging ConnectPackets.
+// A supported mismatch returns the peer version with Incompatible so dial can
+// retry on a new socket; other failures return a zero version and cannot retry.
+func handshake(rw net.Conn, advertised wire.ProtocolVersion) (wire.ProtocolVersion, error) {
 	var pkt [4 + connectPacketLen]byte
 	binary.LittleEndian.PutUint32(pkt[0:], connectPacketLen)
-	binary.LittleEndian.PutUint64(pkt[4:], ProtocolVersion|objectSerializerFlag)
+	binary.LittleEndian.PutUint64(pkt[4:], uint64(advertised)|objectSerializerFlag)
 	// canonicalRemotePort, connectionId, ip4, flags and ip6 stay zero: we are a client.
 	if _, err := rw.Write(pkt[:]); err != nil {
-		return NotDelivered
+		return 0, NotDelivered
 	}
 	var hdr [12]byte
 	if _, err := readFull(rw, hdr[:]); err != nil {
-		return NotDelivered
+		return 0, NotDelivered
 	}
 	n := binary.LittleEndian.Uint32(hdr[0:])
 	version := binary.LittleEndian.Uint64(hdr[4:])
-	if version&compatibleMask != ProtocolVersion&compatibleMask {
-		return Incompatible
-	}
 	if n < 8 || n > 1024 {
-		return Malformed
+		return 0, Malformed
 	}
-	rest := make([]byte, n-8)
-	if _, err := readFull(rw, rest); err != nil {
-		return NotDelivered
+	peer := wire.ProtocolVersion(version & versionMask)
+	if version&objectSerializerFlag == 0 || !peer.Supported() {
+		return 0, Incompatible
 	}
-	return nil
+	for remaining := int(n) - 8; remaining > 0; {
+		count := min(remaining, len(pkt))
+		if _, err := readFull(rw, pkt[:count]); err != nil {
+			return 0, NotDelivered
+		}
+		remaining -= count
+	}
+	if !peer.Compatible(advertised) {
+		return peer, Incompatible
+	}
+	return peer, nil
 }
 
 func readFull(r net.Conn, b []byte) (int, error) {
@@ -308,9 +328,10 @@ func readFull(r net.Conn, b []byte) (int, error) {
 
 // start wraps an established stream (raw, or TLS over raw) and starts the
 // reader, writer and monitor goroutines; all stop when the connection fails.
-func start(addr wire.NetAddr, raw, rw net.Conn, checksum bool) *Connection {
+func start(addr wire.NetAddr, raw, rw net.Conn, checksum bool, protocol wire.ProtocolVersion) *Connection {
 	c := &Connection{
 		addr:     addr,
+		protocol: protocol,
 		raw:      raw,
 		rw:       rw,
 		tokenHi:  rand.Uint64() &^ 1,
@@ -333,6 +354,11 @@ func start(addr wire.NetAddr, raw, rw net.Conn, checksum bool) *Connection {
 
 // Addr returns the address the connection was dialed to.
 func (c *Connection) Addr() wire.NetAddr { return c.addr }
+
+// ProtocolVersion returns the negotiated peer protocol without transport flags.
+// Patch bits are preserved. The value never changes: reconnecting after a server
+// upgrade creates a new Connection rather than reusing or replaying this one's RPCs.
+func (c *Connection) ProtocolVersion() wire.ProtocolVersion { return c.protocol }
 
 // Stats returns the bytes received and sent so far and the time since the
 // connection was established.

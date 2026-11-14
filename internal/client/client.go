@@ -282,7 +282,7 @@ func connectionStatus(ctx *native.DbContext, addresses map[wire.NetAddr]struct{}
 			c["LastConnectTime"] = age.Seconds()
 			c["BytesReceived"] = rx
 			c["BytesSent"] = tx
-			c["ProtocolVersion"] = strconv.FormatUint(transport.ProtocolVersion, 16)
+			c["ProtocolVersion"] = strconv.FormatUint(uint64(p.Connection.ProtocolVersion()), 16)
 		}
 		connections = append(connections, c)
 	}

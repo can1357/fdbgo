@@ -1005,6 +1005,25 @@ func TestConnectOverTLS(t *testing.T) {
 	if err := call(conn, errTok); err != fdberr.FutureVersion {
 		t.Fatalf("got %v", err)
 	}
+	if conn.ProtocolVersion() != wire.Protocol74 || conn.checksum {
+		t.Fatal("TLS connection has wrong protocol or enabled checksums")
+	}
+	checkAdvertisements(t, fs, wire.Protocol74)
+
+	older := newFakeServer(t, testHandler)
+	older.tlsConfig = fs.tlsConfig
+	older.version = uint64(wire.Protocol73) | objectSerializerFlag
+	older.start()
+	negotiated := connect(t, older)
+	if negotiated.ProtocolVersion() != wire.Protocol73 || negotiated.checksum {
+		t.Fatal("negotiated TLS connection has wrong protocol or enabled checksums")
+	}
+	for _, dest := range []wire.UID{echoTok, bigTok} {
+		if err := call(negotiated, dest); err != nil {
+			t.Fatalf("request after TLS protocol negotiation: %v", err)
+		}
+	}
+	checkAdvertisements(t, older, wire.Protocol74, wire.Protocol73)
 
 	c.setVerifyPeers([]byte("S.CN=someone-else"))
 	withNetworkTLS(t, c)

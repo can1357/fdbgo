@@ -1,5 +1,5 @@
 // Package wire implements Flow's ObjectSerializer wire format and every
-// FDB 7.4 RPC message the client sends or receives.
+// FDB 7.3 and 7.4 RPC message the client sends or receives.
 //
 // The format is FlatBuffers-shaped but schema-less: every server type with a
 // serialize() method is a table whose vtable slots are its serializer()
