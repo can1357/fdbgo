@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        shell: bash
+        run: |
+          files=$(git ls-files '*.go' | xargs gofmt -l)
+          if [[ -n "$files" ]]; then
+            printf 'Unformatted Go files:\n%s\n' "$files"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race -count=1 -timeout=5m ./...
+
+  integration:
+    name: FoundationDB 7.4.8
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FDB_VERSION: 7.4.8
+      FDB_RUN: ${{ github.workspace }}/run/ci
+      FDB_CLUSTER_FILE: ${{ github.workspace }}/run/ci/fdb.cluster
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            bench/go.sum
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Check out FoundationDB reference bindings
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: apple/foundationdb
+          ref: 3ce230b696166af33e55aae95c54a185a761981e # 7.4.8
+          path: target/fdb/src
+          persist-credentials: false
+      - name: Download FoundationDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/fdb/{bin,lib,include,dl}
+          printf 'module ignored\n' > target/go.mod
+          cd target/fdb/dl
+          base="https://github.com/apple/foundationdb/releases/download/$FDB_VERSION"
+          for asset in fdbserver.x86_64 "foundationdb-clients_${FDB_VERSION}-1_amd64.deb"; do
+            curl -fsSLO "$base/$asset"
+            curl -fsSLO "$base/$asset.sha256"
+            printf '%s  %s\n' "$(awk '{print $1}' "$asset.sha256")" "$asset" | sha256sum --check --status
+          done
+          install -m 755 fdbserver.x86_64 ../bin/fdbserver
+          dpkg-deb --extract "foundationdb-clients_${FDB_VERSION}-1_amd64.deb" ../sdk
+          install -m 755 ../sdk/usr/bin/fdbcli ../bin/fdbcli
+          install -m 755 ../sdk/usr/lib/libfdb_c.so ../lib/libfdb_c.so
+          cp -R ../sdk/usr/include/foundationdb ../include/
+      - name: Start isolated cluster
+        run: scripts/cluster.sh up 1 memory
+      - name: Integration tests with race detector
+        run: go test -race -count=1 -timeout=5m ./...
+      - name: Build benchmark against the C client
+        run: bench/build.sh
+      - name: Compare against reference binding
+        run: scripts/bindingtester.sh quick
+      - name: Stop cluster
+        if: always()
+        run: scripts/cluster.sh down
