@@ -25,7 +25,7 @@ func TestRecordedReadErrorDoesNotWaitForUnresolvedReads(t *testing.T) {
 		r := newRyw()
 		defer r.Cancel()
 		value := binary.LittleEndian.AppendUint32([]byte("0123456789ab"), 1)
-		r.AtomicOp([]byte("k"), value, MutationSetVersionstampedValue, 0, false)
+		r.AtomicOp([]byte("k"), value, MutationSetVersionstampedValue, AtomicOptions{})
 		_, err := await_(t, capture(r.Get(db, []byte("k"), false)))
 		eqErr(t, err, fdberr.AccessedUnreadable)
 		unresolved := capture(r.Get(db, []byte("q"), false))
@@ -288,7 +288,7 @@ func TestPointReadRunsInWaitWithIssueTimeView(t *testing.T) {
 				defer r.Cancel()
 				want := "db"
 				if dependent {
-					r.AtomicOp([]byte("a"), []byte("-first"), MutationAppendIfFits, 0, false)
+					r.AtomicOp([]byte("a"), []byte("-first"), MutationAppendIfFits, AtomicOptions{})
 					want += "-first"
 				}
 				key := []byte("a")
@@ -353,7 +353,7 @@ func TestDirectReadCancellationDrainsBodyAndTracking(t *testing.T) {
 								r := newRyw()
 								defer r.Cancel()
 								if kind == "dependent" {
-									r.AtomicOp([]byte("a"), []byte("suffix"), MutationAppendIfFits, 0, false)
+									r.AtomicOp([]byte("a"), []byte("suffix"), MutationAppendIfFits, AtomicOptions{})
 								}
 								var wait func(context.Context) ([]byte, error)
 								var err error

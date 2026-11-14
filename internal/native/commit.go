@@ -301,8 +301,12 @@ func commitImpl(ctx context.Context, shared *TxnShared, opts *NativeOptions, pla
 	if err == nil && ci.Version != invalidVersion && opts.AutomaticIdempotency {
 		// Expiration is best effort and belongs to the proxy that accepted
 		// this commit, not whichever proxy is published when the reply arrives.
-		if conn := shared.DB.Peers.Live(proxy.Address(shared.DB.TLS)); conn != nil {
-			conn.Send(proxy.Adjusted(10).Token, wire.ExpireIdempotencyID{
+		if conn := shared.DB.Peers.Live(proxy.Address(shared.DB.TLS)); conn != nil && conn.ProtocolVersion().Normalized() >= wire.Protocol73 {
+			stream := uint32(10)
+			if conn.ProtocolVersion().Normalized() >= wire.Protocol80 {
+				stream = 9
+			}
+			conn.Send(proxy.Adjusted(stream).Token, wire.ExpireIdempotencyID{
 				Version: ci.Version, BatchIndexHighByte: uint8(ci.BatchIndex >> 8),
 			})
 		}

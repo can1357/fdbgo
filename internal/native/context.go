@@ -56,6 +56,8 @@ var errProxiesChanged = errors.New("proxies changed")
 // ClusterInfo is the proxy set of the current cluster generation.
 type ClusterInfo struct {
 	ID wire.UID
+	// Protocol is the coordinator's negotiated protocol, zero before discovery.
+	Protocol wire.ProtocolVersion
 	// GRV holds GrvProxyInterface.getConsistentReadVersion endpoints.
 	GRV []wire.Endpoint
 	// Commit holds CommitProxyInterface.commit endpoints (the interface base).
@@ -784,6 +786,9 @@ func (c *DbContext) ClusterID(ctx context.Context) (wire.UID, error) {
 		if st.info.ClusterID.IsValid() {
 			return st.info.ClusterID, nil
 		}
+		if st.info.Protocol != 0 && st.info.Protocol.Normalized() < wire.Protocol72 {
+			return wire.UID{}, fdberr.UnsupportedOperation
+		}
 		select {
 		case <-st.changed:
 		case <-ctx.Done():
@@ -871,8 +876,8 @@ func (c *DbContext) verifyOldProxies(old, next *ClusterInfo) {
 func (c *DbContext) publish(info *ClusterInfo) {
 	for {
 		old := c.info.Load()
-		changed := old.info.Provisional != info.Provisional ||
-			!slices.Equal(old.info.GRV, info.GRV) || !slices.Equal(old.info.Commit, info.Commit)
+		changed := old.info.Provisional != info.Provisional || !old.info.Protocol.Compatible(info.Protocol) ||
+			!slices.EqualFunc(old.info.GRV, info.GRV, wire.Endpoint.Equal) || !slices.EqualFunc(old.info.Commit, info.Commit, wire.Endpoint.Equal)
 		next := &infoState{info: info, ctx: old.ctx, cancel: old.cancel, changed: make(chan struct{})}
 		if changed {
 			next.ctx, next.cancel = context.WithCancel(c.ctx)
@@ -1333,7 +1338,12 @@ func (c *DbContext) fetchLocations(ctx context.Context, req *wire.GetKeyServerLo
 		if err != nil {
 			return nil, err
 		}
-		shards, _, err := basicLoadBalance(pctx, c, info.Commit, cpGetKeyServersLocations, wire.Request[[]wire.ShardLocation](req), false)
+		var shards []wire.ShardLocation
+		if info.Protocol.Compatible(wire.Protocol50) {
+			shards, err = c.fetchLocations50(pctx, info, req)
+		} else {
+			shards, _, err = basicLoadBalance(pctx, c, info.Commit, cpGetKeyServersLocations, wire.Request[[]wire.ShardLocation](req), false)
+		}
 		changed := proxiesChanged(pctx)
 		release()
 		switch {
@@ -1480,7 +1490,7 @@ generation:
 				Coordinators: addresses,
 				Hostnames:    hostnames,
 			}
-			info, err := c.openDatabase(coord, req)
+			info, protocol, err := c.openDatabase(coord, req)
 			if c.ctx.Err() != nil {
 				return
 			}
@@ -1518,7 +1528,7 @@ generation:
 					c.coordMu.Lock()
 					c.coordinator = coord.String()
 					c.coordMu.Unlock()
-					c.publish(&ClusterInfo{ID: info.ID, GRV: grv, Commit: commit, Provisional: provisional, ClusterID: info.ClusterID})
+					c.publish(&ClusterInfo{ID: info.ID, Protocol: protocol, GRV: grv, Commit: commit, Provisional: provisional, ClusterID: info.ClusterID})
 					successIndex = index
 				}
 				continue
@@ -1557,7 +1567,7 @@ func shrink(eps []wire.Endpoint, last []wire.UID, limit int) ([]wire.Endpoint, [
 		if len(kept) < limit {
 			var rest []wire.Endpoint
 			for _, e := range eps {
-				if !slices.Contains(kept, e) {
+				if !slices.ContainsFunc(kept, e.Equal) {
 					rest = append(rest, e)
 				}
 			}
@@ -1610,12 +1620,23 @@ func pickCoordinatorAddress(addrs []netip.Addr, choose func(int) int) netip.Addr
 	panic("invalid coordinator address selection")
 }
 
-// openDatabase sends OpenDatabaseCoordRequest to one coordinator.
-func (c *DbContext) openDatabase(co cluster.Coordinator, req *wire.OpenDatabase) (wire.ClientDBInfo, error) {
+// openDatabase monitors proxies through the coordinator, or through its elected
+// controller on releases that predate OpenDatabaseCoordRequest.
+func (c *DbContext) openDatabase(co cluster.Coordinator, req *wire.OpenDatabase) (wire.ClientDBInfo, wire.ProtocolVersion, error) {
 	addr, err := resolve(c.ctx, co)
 	if err != nil {
-		return wire.ClientDBInfo{}, err
+		return wire.ClientDBInfo{}, 0, err
 	}
 	ep := wire.Endpoint{Addr: addr, Token: wire.WellKnown(wire.TokenOpenDatabase)}
-	return call(c.ctx, c, ep, wire.Request[wire.ClientDBInfo](req))
+	conn, err := c.Connection(c.ctx, ep)
+	if err != nil {
+		return wire.ClientDBInfo{}, 0, err
+	}
+	protocol := conn.ProtocolVersion()
+	if protocol.Normalized() < wire.Protocol62.Normalized() {
+		info, err := c.openControllerDatabase(addr, req)
+		return info, protocol, err
+	}
+	info, err := transport.Call(c.ctx, conn, ep.Token, wire.Request[wire.ClientDBInfo](req))
+	return info, protocol, storageCallError(c.ctx, c, ep, err)
 }

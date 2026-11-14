@@ -813,7 +813,9 @@ func (t *Txn) ClearRange(begin, end []byte) {
 }
 
 // AtomicOp is fdb_transaction_atomic_op with the C MutationType code; errors
-// are deferred.
+// are deferred. MIN and AND follow the connected C client's API semantics:
+// 5.0 uses the legacy operations, 5.1+ uses MinV2 and AndV2. Before discovery,
+// retain modern local behavior.
 func (t *Txn) AtomicOp(key, param []byte, op int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -825,7 +827,30 @@ func (t *Txn) AtomicOp(key, param []byte, op int) {
 	if op >= 0 && op < int(ryw.MutationMaxAtomicOp) {
 		wireOp = uint8(op)
 	}
-	t.ryw.AtomicOp(key, param, wireOp, rv, ok)
+	var protocol wire.ProtocolVersion
+	switch wireOp {
+	case ryw.MutationMin, ryw.MutationAnd, ryw.MutationAppendIfFits,
+		ryw.MutationSetVersionstampedKey, ryw.MutationSetVersionstampedValue:
+		if t.db.ctx != nil {
+			protocol = t.db.ctx.ClusterNow().Protocol
+		}
+	}
+	if wireOp == ryw.MutationMin || wireOp == ryw.MutationAnd {
+		if protocol == 0 || protocol.Normalized() >= wire.Protocol51.Normalized() {
+			if wireOp == ryw.MutationMin {
+				wireOp = ryw.MutationMinV2
+			} else {
+				wireOp = ryw.MutationAndV2
+			}
+		}
+	}
+	legacyVersionstamps := protocol != 0 && protocol.Normalized() < wire.Protocol52.Normalized()
+	if legacyVersionstamps && wireOp == ryw.MutationAppendIfFits {
+		wireOp = ryw.MutationMaxAtomicOp
+	}
+	t.ryw.AtomicOp(key, param, wireOp, ryw.AtomicOptions{
+		ReadVersion: rv, HasReadVersion: ok, LegacyVersionstamps: legacyVersionstamps,
+	})
 }
 
 // AddConflictRange is fdb_transaction_add_conflict_range with the C
@@ -912,11 +937,15 @@ func (t *Txn) CommittedVersionstamp() ([]byte, error) {
 	return bytes.Clone(outcome.Versionstamp[:]), nil
 }
 
-// GetApproximateSize is fdb_transaction_get_approximate_size: only a deferred
-// error fails it; cancelled or committing transactions still report their size.
+// GetApproximateSize follows the connected C client's deferred-error behavior:
+// before 7.2 size remains readable after a deferred error. Until discovery,
+// local validation retains the current behavior.
 func (t *Txn) GetApproximateSize() (int64, func(ctx context.Context) (int64, error), error) {
 	if err := t.ryw.DeferredError(); err != nil {
-		return 0, nil, err
+		protocol := t.db.ctx.ClusterNow().Protocol
+		if protocol == 0 || protocol.Normalized() >= wire.Protocol72 {
+			return 0, nil, err
+		}
 	}
 	return t.ryw.ApproximateSize(), nil, nil
 }

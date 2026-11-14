@@ -203,6 +203,12 @@ func TestPeersRecoverFailedAddressWithoutRequests(t *testing.T) {
 			}
 			if first {
 				first = false
+				// A clean early close probes 5.0 compatibility. A malformed
+				// header instead exercises address-failure recovery directly.
+				var hello [44]byte
+				if _, err := io.ReadFull(nc, hello[:]); err == nil {
+					_, _ = nc.Write(make([]byte, 12))
+				}
 				nc.Close()
 				continue
 			}

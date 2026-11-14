@@ -8,11 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/can1357/fdbgo/internal/cluster"
 	"github.com/can1357/fdbgo/internal/fdberr"
 	"github.com/can1357/fdbgo/internal/kv"
+	"github.com/can1357/fdbgo/internal/native"
 	"github.com/can1357/fdbgo/internal/options"
 	"github.com/can1357/fdbgo/internal/ryw"
 	"github.com/can1357/fdbgo/internal/transport"
+	"github.com/can1357/fdbgo/internal/wire"
 )
 
 // localTxn has no database connection: tests must use only local operations.
@@ -215,6 +218,169 @@ func TestElapsedTimeoutFailsSynchronously(t *testing.T) {
 	}
 	if tr.timer != nil {
 		t.Fatal("elapsed deadline must not rely on a scheduled timer")
+	}
+}
+
+// localProtocolTxn freezes discovery before publishing a negotiated protocol.
+// Only local operations and commit-plan encoding are used.
+func localProtocolTxn(t *testing.T, protocol wire.ProtocolVersion) *Txn {
+	t.Helper()
+	ctx := native.NewDbContext(cluster.ConnectionRecord{Conn: cluster.ConnectionString{
+		Coordinators: []cluster.Coordinator{{}},
+	}}, false)
+	ctx.Close()
+	ctx.ClusterNow().Protocol = protocol
+	db := &Db{ctx: ctx, opts: dbOptions{snapshotRYW: 1}}
+	tr, err := db.CreateTransaction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tr.Close)
+	return tr
+}
+
+func TestAtomicMinAndFollowConnectedClientSemantics(t *testing.T) {
+	for _, version := range []struct {
+		name     string
+		protocol wire.ProtocolVersion
+		legacy   bool
+	}{
+		{"unknown", 0, false},
+		{"5.0", wire.Protocol50, true},
+		{"5.0_flags", wire.Protocol50 | 0x8000000000000000, true},
+		{"5.1", wire.Protocol51, false},
+		{"5.1_flags", wire.Protocol51 | 0x8000000000000000, false},
+		{"5.2", wire.Protocol52, false},
+		{"7.2", wire.Protocol72, false},
+		{"8.0", wire.Protocol80, false},
+	} {
+		t.Run(version.name, func(t *testing.T) {
+			for _, op := range []struct {
+				name string
+				code uint8
+			}{
+				{"min", ryw.MutationMin},
+				{"and", ryw.MutationAnd},
+			} {
+				t.Run(op.name, func(t *testing.T) {
+					for _, empty := range []bool{false, true} {
+						tr := localProtocolTxn(t, version.protocol)
+						key := []byte("key")
+						if empty {
+							tr.Set(key, []byte{})
+						} else {
+							tr.Clear(key)
+						}
+						tr.AtomicOp(key, []byte{0x3f, 0x0f}, int(op.code))
+						want := []byte{0x3f, 0x0f}
+						if empty || version.legacy {
+							want = []byte{0, 0}
+						}
+						for _, snapshot := range []bool{false, true} {
+							value, wait, err := tr.Get(key, snapshot)
+							if err != nil || wait != nil || value == nil || !bytes.Equal(value, want) {
+								t.Fatalf("empty=%v snapshot=%v: value=%x pending=%v error=%v; want %x",
+									empty, snapshot, value, wait != nil, err, want)
+							}
+						}
+						plan, wait, err := tr.ryw.Commit()
+						if err != nil || wait != nil || len(plan.Mutations) != 1 ||
+							plan.Mutations[0].Kind != ryw.MutationSetValue || !bytes.Equal(plan.Mutations[0].Param2, want) ||
+							len(plan.ReadConflicts) != 0 {
+							t.Fatalf("empty=%v: plan=%+v pending=%v error=%v", empty, plan, wait != nil, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestAtomicMinAndWithoutDiscoveryContextRemainModern(t *testing.T) {
+	for _, op := range []uint8{ryw.MutationMin, ryw.MutationAnd} {
+		tr := localTxn(t)
+		tr.Clear([]byte("key"))
+		tr.AtomicOp([]byte("key"), []byte{7}, int(op))
+		value, wait, err := tr.Get([]byte("key"), false)
+		if err != nil || wait != nil || !bytes.Equal(value, []byte{7}) {
+			t.Fatalf("op %d: value=%x pending=%v error=%v", op, value, wait != nil, err)
+		}
+	}
+}
+
+func TestAtomicConnectedCommitPreservesWireOperationsAndFeatureGates(t *testing.T) {
+	for _, protocol := range []wire.ProtocolVersion{wire.Protocol50, wire.Protocol51, wire.Protocol60, wire.Protocol61} {
+		for _, disabled := range []bool{false, true} {
+			for _, op := range []uint8{ryw.MutationMin, ryw.MutationAnd, ryw.MutationByteMin, ryw.MutationCompareAndClear} {
+				tr := localProtocolTxn(t, protocol)
+				if disabled {
+					if err := tr.SetOption(options.TransactionReadYourWritesDisable, nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				tr.AtomicOp([]byte("key"), []byte{7}, int(op))
+				plan, wait, err := tr.ryw.Commit()
+				if err != nil || wait != nil || len(plan.Mutations) != 1 {
+					t.Fatalf("protocol=%x disabled=%v op=%d: plan=%+v pending=%v error=%v",
+						protocol, disabled, op, plan, wait != nil, err)
+				}
+				wantOp := op
+				if !protocol.Compatible(wire.Protocol50) {
+					switch op {
+					case ryw.MutationMin:
+						wantOp = ryw.MutationMinV2
+					case ryw.MutationAnd:
+						wantOp = ryw.MutationAndV2
+					}
+				}
+				if plan.Mutations[0].Kind != wantOp {
+					t.Fatalf("protocol=%x disabled=%v op=%d: wire op=%d, want %d",
+						protocol, disabled, op, plan.Mutations[0].Kind, wantOp)
+				}
+				var builder wire.Builder
+				err = wire.EncodeLegacy(&builder, &wire.Commit{Mutations: plan.Mutations}, wire.UID{}, protocol)
+				unsupported := op == ryw.MutationByteMin && protocol.Compatible(wire.Protocol50) ||
+					op == ryw.MutationCompareAndClear && protocol.Normalized() < wire.Protocol61.Normalized()
+				if unsupported && !errors.Is(err, fdberr.UnsupportedOperation) || !unsupported && err != nil {
+					t.Fatalf("protocol=%x disabled=%v op=%d: encode error=%v, unsupported=%v",
+						protocol, disabled, op, err, unsupported)
+				}
+			}
+		}
+	}
+}
+
+func TestAtomicProtocolNormalizationPreservesErrorPriority(t *testing.T) {
+	for _, protocol := range []wire.ProtocolVersion{wire.Protocol50, wire.Protocol51} {
+		for _, op := range []int{int(ryw.MutationMin), int(ryw.MutationAnd), -1, 262, 269} {
+			tr := localProtocolTxn(t, protocol)
+			tr.AtomicOp([]byte("\xff/illegal"), []byte{1}, op)
+			if err := tr.ryw.DeferredError(); !errors.Is(err, fdberr.KeyOutsideLegalRange) {
+				t.Fatalf("protocol=%x op=%d: illegal key error=%v", protocol, op, err)
+			}
+			tr.Reset()
+			tr.ryw.SetDeferredError(fdberr.ValueTooLarge)
+			tr.AtomicOp([]byte("\xff/illegal"), []byte{1}, op)
+			if err := tr.ryw.DeferredError(); !errors.Is(err, fdberr.ValueTooLarge) {
+				t.Fatalf("protocol=%x op=%d: prior deferred error=%v", protocol, op, err)
+			}
+			tr.Reset()
+			tr.Set([]byte("key"), []byte("value"))
+			if _, wait, err := tr.ryw.Commit(); err != nil || wait != nil {
+				t.Fatalf("commit: pending=%v error=%v", wait != nil, err)
+			}
+			tr.AtomicOp([]byte("\xff/illegal"), []byte{1}, op)
+			if err := tr.ryw.DeferredError(); !errors.Is(err, fdberr.UsedDuringCommit) {
+				t.Fatalf("protocol=%x op=%d: during commit error=%v", protocol, op, err)
+			}
+			if op < 0 || op >= int(ryw.MutationMaxAtomicOp) {
+				tr.Reset()
+				tr.AtomicOp([]byte("key"), []byte{1}, op)
+				if err := tr.ryw.DeferredError(); !errors.Is(err, fdberr.InvalidMutationType) {
+					t.Fatalf("protocol=%x op=%d: invalid opcode error=%v", protocol, op, err)
+				}
+			}
+		}
 	}
 }
 

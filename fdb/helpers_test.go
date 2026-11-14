@@ -2,11 +2,16 @@ package fdb
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/can1357/fdbgo/internal/wire"
 )
 
 // openTestDB opens the cluster named by FDB_CLUSTER_FILE, skipping the test
@@ -23,6 +28,45 @@ func openTestDB(t testing.TB) *Database {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// serverBefore checks the negotiated protocol after the test has contacted its cluster.
+func serverBefore(t testing.TB, db *Database, minimum wire.ProtocolVersion) bool {
+	t.Helper()
+	status, err := db.ClientStatus(testCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Connections []struct{ ProtocolVersion string }
+	}
+	if err := json.Unmarshal(status, &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, connection := range document.Connections {
+		if connection.ProtocolVersion == "" {
+			continue
+		}
+		version, err := strconv.ParseUint(connection.ProtocolVersion, 16, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return wire.ProtocolVersion(version).Normalized() < minimum.Normalized()
+	}
+	t.Fatal("no negotiated protocol after contacting cluster")
+	return false
+}
+
+// unavailableBefore verifies an explicit rejection on a server lacking the feature.
+func unavailableBefore(t testing.TB, db *Database, err error, minimum wire.ProtocolVersion) bool {
+	t.Helper()
+	if !serverBefore(t, db, minimum) {
+		return false
+	}
+	if !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("legacy feature result = %v; want unsupported_operation", err)
+	}
+	return true
 }
 
 // testCtx returns a context bounding the whole test.

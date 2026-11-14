@@ -63,7 +63,7 @@ func statusTestControllerInfo(ep wire.Endpoint) []byte {
 	ci := b.EndTable()
 	b.StartTable(1)
 	b.AddOffset(0, ci)
-	return append(binary.LittleEndian.AppendUint64(nil, 0x1fdb00b074000000), b.FinishRequest(b.EndTable(), 1)...)
+	return append(binary.LittleEndian.AppendUint64(nil, 0x0fdb00b074000000), b.FinishRequest(b.EndTable(), 1)...)
 }
 
 // statusTestHandler speaks the real status RPCs. Nil replies deliberately leave

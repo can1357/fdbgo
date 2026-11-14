@@ -1,20 +1,13 @@
 package wire
 
-// FDB 7.3/7.4 RPC messages: encoders for the requests a client sends and decoders
+// FoundationDB RPC messages: encoders for the requests a client sends and decoders
 // for the replies it receives. Each layout follows the serializer() field
 // order of the same-named FoundationDB message, with slot numbers assigned
 // per flat.go: unions take two slots, Arena members none. Fields a client
 // never sets are omitted; Flow's reader default-constructs them.
 //
-// The client-facing ObjectSerializer layouts and file identifiers are identical
-// in upstream 7.3.81 and 7.4.8: CoordinationInterface.h (OpenDatabase),
-// CommitProxyInterface.h (ClientDBInfo, GRV, commit, locations, idempotency
-// expiration), StorageServerInterface.h (reads, watches, metrics, splits), and
-// FlowTransport.actor.cpp (ping and notices). Their nested FDBTypes.h,
-// TagThrottle.actor.h, IdempotencyId.actor.h, TenantInfo.h and network types also
-// share layouts. There is deliberately no protocol branch in these codecs.
-// 7.4 only appends streams beyond the interface offsets we use. Its optional
-// MutationRef checksums do not change the unflagged mutations emitted here.
+// Layout differences are selected by the negotiated protocol carried by Builder
+// and Table; object_versions.go records the older serializer layouts.
 
 import (
 	"bytes"
@@ -80,11 +73,36 @@ type Endpoint struct {
 	// plaintext; Alt.Addr invalid means none.
 	Alt   NetAddr
 	Token UID
+	// Streams holds independently allocated pre-SmallEndpoints stream tokens.
+	// It is immutable after discovery; compact interfaces leave it nil.
+	Streams *EndpointStreams
+}
+
+// EndpointStreams maps canonical interface stream offsets to older full tokens.
+type EndpointStreams struct {
+	Tokens  [15]UID
+	Present uint16
+}
+
+// Equal compares endpoint identity and immutable independently allocated streams.
+func (e Endpoint) Equal(other Endpoint) bool {
+	if e.Addr != other.Addr || e.Alt != other.Alt || e.Token != other.Token {
+		return false
+	}
+	if e.Streams == other.Streams {
+		return true
+	}
+	return e.Streams != nil && other.Streams != nil && *e.Streams == *other.Streams
 }
 
 // Adjusted returns the endpoint of stream i: interfaces serialize one
 // base endpoint and derive their other streams by index.
 func (e Endpoint) Adjusted(i uint32) Endpoint {
+	if e.Streams != nil && i < 15 && e.Streams.Present&(1<<i) != 0 {
+		e.Token = e.Streams.Tokens[i]
+		e.Streams = nil
+		return e
+	}
 	idx := uint32(e.Token.Second) + i
 	e.Token = UID{e.Token.First + uint64(i)<<32, e.Token.Second&0xffff_ffff_0000_0000 | uint64(idx)}
 	return e
@@ -135,7 +153,12 @@ func replyPromise(b *Builder, token UID) Off {
 // an absent TenantInfo deserializes as unauthorized and fails verify().
 func noTenant(b *Builder) Off {
 	b.StartTable(3)
-	b.AddI64(0, -1)
+	if objectProtocol(b.Protocol) <= object72 {
+		// 7.1/7.2 TenantInfo starts with Optional<TenantName>, tenantId.
+		b.AddI64(2, -1)
+	} else {
+		b.AddI64(0, -1)
+	}
 	return b.EndTable()
 }
 
@@ -164,7 +187,11 @@ func readOptions(b *Builder, o ReadOpts) Off {
 	if debug != 0 {
 		b.AddUnion(2, 1, debug)
 	}
-	b.AddBool(6, o.LockAware)
+	// Storage range-lock bypass starts in 7.3. Database-lock awareness is
+	// already enforced by the client's GRV path on older servers.
+	if objectProtocol(b.Protocol) >= Protocol73 {
+		b.AddBool(6, o.LockAware)
+	}
 	return b.EndTable()
 }
 
@@ -326,6 +353,9 @@ func endpoint(ep Table) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, err
 	}
+	if tag > 1 {
+		return Endpoint{}, ErrMalformed
+	}
 	if tag == 1 {
 		t, err := f.Table()
 		if err != nil {
@@ -415,8 +445,8 @@ type Request[R any] interface {
 
 // ReplyTable unwraps a reply message's ErrorOr<EnsureTable<T>> into T's
 // table. A remote error is returned as fdberr.Error; a parse failure as ErrMalformed.
-func ReplyTable(msg []byte) (Table, error) {
-	root, err := Root(msg)
+func ReplyTable(msg []byte, protocol ...ProtocolVersion) (Table, error) {
+	root, err := Root(msg, protocol...)
 	if err != nil {
 		return Table{}, err
 	}
@@ -436,18 +466,40 @@ func ReplyTable(msg []byte) (Table, error) {
 		}
 		return Table{}, fdberr.Error(c)
 	case 2:
+		if objectProtocol(root.Protocol) == Protocol62.Normalized() &&
+			len(msg) >= 8 && binary.LittleEndian.Uint32(msg[4:8]) == 1<<24|FIDVoid {
+			// 6.2's zero-argument serializer(Archive&) overload is a no-op
+			// (flow/serialize.h), so Void writes no table. Its union offset
+			// points exactly one past the buffer. 6.3 removes that overload.
+			offset, err := le32(f.msg, f.pos)
+			if err == nil && uint64(f.pos)+uint64(offset) == uint64(len(msg)) {
+				return Table{Protocol: root.Protocol, msg: msg}, nil
+			}
+		}
 		return f.Table()
 	}
 	return Table{}, ErrMalformed
 }
 
 // DecodeReply unwraps msg with ReplyTable and decodes it as req's reply.
-func DecodeReply[R any](req Request[R], msg []byte) (R, error) {
-	if len(msg) < 8 || binary.LittleEndian.Uint32(msg[4:8]) != req.ReplyFileID() {
+func DecodeReply[R any](req Request[R], msg []byte, protocol ...ProtocolVersion) (R, error) {
+	var p ProtocolVersion
+	if len(protocol) != 0 {
+		p = protocol[0]
+	}
+	fileID := req.ReplyFileID()
+	if v, ok := req.(interface{ ReplyFileIDProtocol(ProtocolVersion) uint32 }); ok {
+		// Nested composed identifiers changed their encoding in 7.0 too;
+		// their payload type, not just ErrorOr's prefix, must be selected.
+		fileID = v.ReplyFileIDProtocol(p)
+	} else {
+		fileID = replyFileIDProtocol(fileID, p)
+	}
+	if len(msg) < 8 || binary.LittleEndian.Uint32(msg[4:8]) != fileID {
 		var zero R
 		return zero, ErrMalformed
 	}
-	t, err := ReplyTable(msg)
+	t, err := ReplyTable(msg, protocol...)
 	if err != nil {
 		var zero R
 		return zero, err
@@ -459,7 +511,7 @@ func DecodeReply[R any](req Request[R], msg []byte) (R, error) {
 func EncodeRequest[R any](b *Builder, req Request[R], reply UID) []byte {
 	b.Reset()
 	off := req.Encode(b, reply)
-	return b.FinishRequest(off, req.FileID())
+	return b.FinishRequest(off, MessageFileID(req, b.Protocol))
 }
 
 // ---- messages --------------------------------------------------------------
@@ -540,7 +592,9 @@ func (r OpenDatabase) Encode(b *Builder, reply UID) Off {
 	if hosts != 0 {
 		b.AddOffset(7, hosts)
 	}
-	b.AddBool(8, true)
+	if objectProtocol(b.Protocol) >= object71 {
+		b.AddBool(8, true)
+	}
 	return b.EndTable()
 }
 
@@ -549,6 +603,9 @@ func (r OpenDatabase) Encode(b *Builder, reply UID) Off {
 // metaclusterName(2). Both proxy interfaces serialize processId(2),
 // provisional, then their base stream.
 func (OpenDatabase) Decode(msg []byte, t Table) (ClientDBInfo, error) {
+	if objectProtocol(t.Protocol) < object70 {
+		return decodeCombinedProxies(t)
+	}
 	proxies := func(slot int) ([]ProxyEndpoint, error) {
 		v, err := t.Vector(slot)
 		if err != nil {
@@ -590,7 +647,16 @@ func (OpenDatabase) Decode(msg []byte, t Table) (ClientDBInfo, error) {
 	if info.Forward, err = optionalBytes(t, 3); err != nil {
 		return ClientDBInfo{}, err
 	}
-	if info.ClusterID, err = t.UID(9); err != nil {
+	clusterIDSlot := 9
+	if objectProtocol(t.Protocol) == object72 {
+		clusterIDSlot = 10
+	} else if t.Protocol.Normalized() >= Protocol80 {
+		clusterIDSlot = 6
+	}
+	if objectProtocol(t.Protocol) < object72 {
+		return info, nil
+	}
+	if info.ClusterID, err = t.UID(clusterIDSlot); err != nil {
 		return ClientDBInfo{}, err
 	}
 	return info, nil
@@ -650,6 +716,9 @@ func (GetReadVersion) ReplyFileID() uint32 { return FIDErrorOr | 15709388 }
 
 // Encode implements Request.
 func (r GetReadVersion) Encode(b *Builder, reply UID) Off {
+	if objectProtocol(b.Protocol) < object63 {
+		return encodeReadVersion62(b, r, reply)
+	}
 	debug := optionalUID(b, r.DebugID)
 	var tags Off
 	if len(r.Tags) > 0 {
@@ -674,12 +743,17 @@ func (r GetReadVersion) Encode(b *Builder, reply UID) Off {
 		b.AddUnion(3, 1, debug)
 	}
 	b.AddOffset(5, rp)
-	b.AddI64(7, InvalidVersion)
+	if objectProtocol(b.Protocol) >= object71 {
+		b.AddI64(7, InvalidVersion)
+	}
 	return b.EndTable()
 }
 
 // Decode implements Request.
 func (GetReadVersion) Decode(msg []byte, t Table) (ReadVersionReply, error) {
+	if objectProtocol(t.Protocol) < object63 {
+		return decodeReadVersion62(t)
+	}
 	var r ReadVersionReply
 	v, err := t.Vector(5)
 	if err != nil {
@@ -748,6 +822,9 @@ type StorageServer struct {
 }
 
 func storageServer(ssi Table) (StorageServer, error) {
+	if objectProtocol(ssi.Protocol) < object63 {
+		return decodeStorageServer62(ssi)
+	}
 	var s StorageServer
 	lt, ok, err := ssi.Table(1)
 	if err != nil {
@@ -770,15 +847,21 @@ func storageServer(ssi Table) (StorageServer, error) {
 // DecodeServerListValue decodes the versioned StorageServerInterface stored
 // under \xff/serverList/. Returned locality slices alias value.
 func DecodeServerListValue(value []byte) (StorageServer, error) {
-	if len(value) < 16 {
+	if len(value) < 8 {
 		return StorageServer{}, ErrMalformed
 	}
 	version := binary.LittleEndian.Uint64(value)
+	if version&0x1000_0000_0000_0000 == 0 {
+		return DecodeServerListValueLegacy(value)
+	}
+	if len(value) < 16 {
+		return StorageServer{}, ErrMalformed
+	}
 	if version&0x0fff_ffff_ffff_ffff < 0x0fdb_00b0_7101_0000 || version&0x1000_0000_0000_0000 == 0 ||
 		binary.LittleEndian.Uint32(value[12:]) != 15302073 {
 		return StorageServer{}, ErrMalformed
 	}
-	root, err := Root(value[8:])
+	root, err := Root(value[8:], ProtocolVersion(version).Normalized())
 	if err != nil {
 		return StorageServer{}, err
 	}
@@ -825,7 +908,7 @@ func DecodeKeyServersValue(value []byte, serverTags []kv.KeyValue) ([]UID, error
 	}
 	version := binary.LittleEndian.Uint64(value) & 0x0fff_ffff_ffff_ffff
 	if version < 0x0fdb_00b0_6201_0001 {
-		return nil, ErrMalformed
+		return DecodeKeyServersValueLegacy(value)
 	}
 	tagEncoded := version >= 0x0fdb_00b0_6301_0000 && version < 0x0fdb_00b0_7200_0000
 	size := 16
@@ -957,6 +1040,12 @@ func (GetKeyServerLocations) ReplyFileID() uint32 { return FIDErrorOr | 10636023
 
 // Encode implements Request.
 func (r GetKeyServerLocations) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80GetKeyServerLocations(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) < object72 {
+		return encodeLocationsOld(b, r, reply)
+	}
 	bo := b.Bytes(r.Begin)
 	var eo Off
 	if r.End != nil {
@@ -1054,6 +1143,12 @@ func (*GetValue) ReplyFileID() uint32 { return FIDErrorOr | 1378929 }
 
 // Encode implements Request.
 func (r *GetValue) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80GetValue(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) < object72 {
+		return encodeReadOld(b, r.Key, nil, nil, 0, 0, &r.Ctx, reply)
+	}
 	ko := b.Bytes(r.Key)
 	c := writeCtx(b, &r.Ctx)
 	rp := replyPromise(b, reply)
@@ -1098,6 +1193,12 @@ func (*GetKey) ReplyFileID() uint32 { return FIDErrorOr | 11226513 }
 
 // Encode implements Request.
 func (r *GetKey) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80GetKey(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) < object72 {
+		return encodeReadOld(b, nil, &r.Sel, nil, 0, 0, &r.Ctx, reply)
+	}
 	so := keySelector(b, &r.Sel)
 	c := writeCtx(b, &r.Ctx)
 	rp := replyPromise(b, reply)
@@ -1153,6 +1254,12 @@ func (*GetKeyValues) ReplyFileID() uint32 { return FIDErrorOr | 1783066 }
 
 // Encode implements Request.
 func (r *GetKeyValues) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80GetKeyValues(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) < object72 {
+		return encodeReadOld(b, nil, &r.Begin, &r.End, r.Limit, r.LimitBytes, &r.Ctx, reply)
+	}
 	bo := keySelector(b, &r.Begin)
 	eo := keySelector(b, &r.End)
 	c := writeCtx(b, &r.Ctx)
@@ -1270,6 +1377,12 @@ func (*GetMappedKeyValues) ReplyFileID() uint32 { return FIDErrorOr | 1783067 }
 
 // Encode implements Request.
 func (r *GetMappedKeyValues) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80GetMappedKeyValues(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) == object71 {
+		return encodeMapped71(b, r, reply)
+	}
 	bo := keySelector(b, &r.Begin)
 	eo := keySelector(b, &r.End)
 	mo := b.Bytes(r.Mapper)
@@ -1448,6 +1561,12 @@ func (*WatchValue) ReplyFileID() uint32 { return FIDErrorOr | 3 }
 
 // Encode implements Request.
 func (r *WatchValue) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80WatchValue(b, r, reply)
+	}
+	if objectProtocol(b.Protocol) < object63 {
+		return encodeWatch62(b, r, reply)
+	}
 	debug := optionalUID(b, r.DebugID)
 	ko := b.Bytes(r.Key)
 	var vo, tags Off
@@ -1458,7 +1577,10 @@ func (r *WatchValue) Encode(b *Builder, reply UID) Off {
 		tags = tagSet(b, r.Tags)
 	}
 	rp := replyPromise(b, reply)
-	tn := noTenant(b)
+	var tn Off
+	if objectProtocol(b.Protocol) >= object71 {
+		tn = noTenant(b)
+	}
 	b.StartTable(11)
 	b.AddOffset(0, ko)
 	if r.Value != nil {
@@ -1472,7 +1594,9 @@ func (r *WatchValue) Encode(b *Builder, reply UID) Off {
 		b.AddUnion(6, 1, debug)
 	}
 	b.AddOffset(8, rp)
-	b.AddOffset(10, tn)
+	if tn != 0 {
+		b.AddOffset(10, tn)
+	}
 	return b.EndTable()
 }
 
@@ -1537,7 +1661,10 @@ type ExpireIdempotencyID struct {
 func (ExpireIdempotencyID) FileID() uint32 { return 1900933 }
 
 // Encode implements Message; expiration is a one-way notification.
-func (r ExpireIdempotencyID) Encode(b *Builder, _ UID) Off {
+func (r ExpireIdempotencyID) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80ExpireIdempotencyID(b, r, reply)
+	}
 	tenant := noTenant(b)
 	b.StartTable(3)
 	b.AddI64(0, r.Version)
@@ -1562,6 +1689,9 @@ func (*Commit) ReplyFileID() uint32 { return FIDErrorOr | 14254927 }
 
 // Encode implements Request.
 func (r *Commit) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80Commit(b, r, reply)
+	}
 	debug := optionalUID(b, r.DebugID)
 	m := b.Mark()
 	for i := range r.ReadConflicts {
@@ -1589,7 +1719,9 @@ func (r *Commit) Encode(b *Builder, reply UID) Off {
 	b.AddOffset(2, muts)
 	b.AddI64(3, r.ReadSnapshot)
 	b.AddBool(4, r.ReportConflictingKeys)
-	b.AddBool(5, r.LockAware)
+	if objectProtocol(b.Protocol) >= object71 {
+		b.AddBool(5, r.LockAware)
+	}
 	tx := b.EndTable()
 
 	var tags, idmp, cost Off
@@ -1616,11 +1748,18 @@ func (r *Commit) Encode(b *Builder, reply UID) Off {
 		idmp = b.Bytes(r.IdempotencyID)
 	}
 	rp := replyPromise(b, reply)
-	tn := noTenant(b)
+	var tn Off
+	if objectProtocol(b.Protocol) >= object71 {
+		tn = noTenant(b)
+	}
 	b.StartTable(12)
 	b.AddOffset(0, tx)
 	b.AddOffset(1, rp)
-	b.AddU32(2, r.Flags)
+	flags := r.Flags
+	if objectProtocol(b.Protocol) < object71 && r.LockAware {
+		flags |= CommitFlagIsLockAware
+	}
+	b.AddU32(2, flags)
 	if debug != 0 {
 		b.AddUnion(3, 1, debug)
 	}
@@ -1630,7 +1769,9 @@ func (r *Commit) Encode(b *Builder, reply UID) Off {
 	if tags != 0 {
 		b.AddUnion(7, 1, tags)
 	}
-	b.AddOffset(10, tn)
+	if tn != 0 {
+		b.AddOffset(10, tn)
+	}
 	if r.IdempotencyID != nil {
 		b.AddOffset(11, idmp)
 	}
@@ -1684,8 +1825,12 @@ func storageMetrics(b *Builder, m *StorageMetrics) Off {
 	b.AddI64(0, m.Bytes)
 	b.AddI64(1, m.BytesWrittenPerKSecond)
 	b.AddI64(2, m.IOsPerKSecond)
-	b.AddI64(3, m.BytesReadPerKSecond)
-	b.AddI64(4, m.OpsReadPerKSecond)
+	if objectProtocol(b.Protocol) >= object63 {
+		b.AddI64(3, m.BytesReadPerKSecond)
+	}
+	if objectProtocol(b.Protocol) >= Protocol73 {
+		b.AddI64(4, m.OpsReadPerKSecond)
+	}
 	return b.EndTable()
 }
 
@@ -1704,17 +1849,25 @@ func (*WaitMetrics) ReplyFileID() uint32 { return FIDErrorOr | 13622226 }
 
 // Encode implements Request.
 func (r *WaitMetrics) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80WaitMetrics(b, r, reply)
+	}
 	kr := keyRange(b, r.Range.Begin, r.Range.End)
 	mn := storageMetrics(b, &r.Min)
 	mx := storageMetrics(b, &r.Max)
 	rp := replyPromise(b, reply)
-	tn := noTenant(b)
+	var tn Off
+	if objectProtocol(b.Protocol) >= Protocol73 {
+		tn = noTenant(b)
+	}
 	b.StartTable(6)
 	b.AddOffset(0, kr)
 	b.AddOffset(1, mn)
 	b.AddOffset(2, mx)
 	b.AddOffset(3, rp)
-	b.AddOffset(4, tn)
+	if tn != 0 {
+		b.AddOffset(4, tn)
+	}
 	return b.EndTable()
 }
 
@@ -1745,14 +1898,22 @@ func (*SplitRange) ReplyFileID() uint32 { return FIDErrorOr | 11813134 }
 
 // Encode implements Request.
 func (r *SplitRange) Encode(b *Builder, reply UID) Off {
+	if b.Protocol.Normalized() >= Protocol80 {
+		return encode80SplitRange(b, r, reply)
+	}
 	kr := keyRange(b, r.Range.Begin, r.Range.End)
 	rp := replyPromise(b, reply)
-	tn := noTenant(b)
+	var tn Off
+	if objectProtocol(b.Protocol) >= object71 {
+		tn = noTenant(b)
+	}
 	b.StartTable(4)
 	b.AddOffset(0, kr)
 	b.AddI64(1, r.ChunkSize)
 	b.AddOffset(2, rp)
-	b.AddOffset(3, tn)
+	if tn != 0 {
+		b.AddOffset(3, tn)
+	}
 	return b.EndTable()
 }
 
@@ -1785,6 +1946,9 @@ func (Ping) ReplyFileID() uint32 { return FIDErrorOr | FIDVoid }
 // Encode implements Request.
 func (Ping) Encode(b *Builder, reply UID) Off {
 	rp := replyPromise(b, reply)
+	if objectProtocol(b.Protocol) < object70 {
+		return rp
+	}
 	b.StartTable(1)
 	b.AddOffset(0, rp)
 	return b.EndTable()
@@ -1794,14 +1958,17 @@ func (Ping) Encode(b *Builder, reply UID) Off {
 func (Ping) Decode(msg []byte, t Table) (struct{}, error) { return struct{}{}, nil }
 
 // PingReplyToken extracts the reply token of a peer's PingRequest.
-func PingReplyToken(msg []byte) (UID, error) {
-	root, err := Root(msg)
+func PingReplyToken(msg []byte, protocol ...ProtocolVersion) (UID, error) {
+	root, err := Root(msg, protocol...)
 	if err != nil {
 		return UID{}, err
 	}
 	req, err := root.mustTable(0)
 	if err != nil {
 		return UID{}, err
+	}
+	if objectProtocol(root.Protocol) < object70 {
+		return req.UID(0)
 	}
 	rp, err := req.mustTable(0)
 	if err != nil {
@@ -1816,14 +1983,21 @@ func EncodeVoidReply(b *Builder) []byte {
 	b.StartTable(2)
 	b.AddUnion(0, 2, v)
 	root := b.EndTable()
-	return b.Finish(root, FIDErrorOr|FIDVoid)
+	return b.Finish(root, replyFileIDProtocol(FIDErrorOr|FIDVoid, b.Protocol))
 }
 
 // NoticeToken extracts the token of an EndpointNotFound/UnauthorizedEndpoint notice (a serialized UID).
-func NoticeToken(msg []byte) (UID, error) {
-	root, err := Root(msg)
+func NoticeToken(msg []byte, protocol ...ProtocolVersion) (UID, error) {
+	root, err := Root(msg, protocol...)
 	if err != nil {
 		return UID{}, err
+	}
+	if objectProtocol(root.Protocol) < object70 {
+		ep, err := root.mustTable(0)
+		if err != nil {
+			return UID{}, err
+		}
+		return ep.UID(1)
 	}
 	return root.UID(0)
 }

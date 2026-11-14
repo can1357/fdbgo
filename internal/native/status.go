@@ -3,6 +3,7 @@ package native
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,8 @@ type leader struct {
 	changeID wire.UID
 	info     []byte
 	forward  bool
+	// The version prefix does not identify the serializer; 6.2 supports both.
+	object bool
 }
 
 // leaderReply is Optional<LeaderInfo>; ok false = none.
@@ -46,11 +49,22 @@ type leaderReply struct {
 }
 
 // getLeaderReq is GetLeaderRequest: key, knownLeader, reply.
-type getLeaderReq struct{ key []byte }
+type getLeaderReq struct {
+	key   []byte
+	known wire.UID
+}
 
 func (getLeaderReq) FileID() uint32 { return 214727 }
 
 func (getLeaderReq) ReplyFileID() uint32 { return 2<<28 | 4<<24 | 8338794 }
+
+// ReplyFileIDProtocol preserves the pre-7.0 OR-composed ErrorOr<Optional<LeaderInfo>> identifier.
+func (r getLeaderReq) ReplyFileIDProtocol(protocol wire.ProtocolVersion) uint32 {
+	if protocol != 0 && protocol.Normalized() < wire.Protocol70.Normalized() {
+		return 0x11<<24 | 8338794
+	}
+	return r.ReplyFileID()
+}
 
 func (r getLeaderReq) Encode(b *wire.Builder, reply wire.UID) wire.Off {
 	k := b.Bytes(r.key)
@@ -59,6 +73,7 @@ func (r getLeaderReq) Encode(b *wire.Builder, reply wire.UID) wire.Off {
 	rp := b.EndTable()
 	b.StartTable(3)
 	b.AddOffset(0, k)
+	b.AddUID(1, r.known)
 	b.AddOffset(2, rp)
 	return b.EndTable()
 }
@@ -89,7 +104,7 @@ func (getLeaderReq) Decode(msg []byte, t wire.Table) (leaderReply, error) {
 		if err != nil {
 			return leaderReply{}, err
 		}
-		return leaderReply{leader{id, info, fwd}, true}, nil
+		return leaderReply{leader{changeID: id, info: info, forward: fwd, object: true}, true}, nil
 	}
 	return leaderReply{}, wire.ErrMalformed
 }
@@ -132,14 +147,20 @@ func (statusReq) Decode(msg []byte, t wire.Table) ([]byte, error) { return t.Byt
 
 // statusEndpoint returns ClusterInterface.databaseStatus from a serialized
 // ClusterControllerClientInterface.
-func statusEndpoint(info []byte) (wire.Endpoint, error) {
+func statusEndpoint(info []byte, object bool) (wire.Endpoint, error) {
 	if len(info) < 8 {
 		return wire.Endpoint{}, wire.ErrMalformed
+	}
+	protocol := wire.ProtocolVersion(binary.LittleEndian.Uint64(info[:8]))
+	if !object {
+		_, status, err := wire.DecodeControllerEndpointsLegacy(info)
+		return status, err
 	}
 	root, err := wire.Root(info[8:])
 	if err != nil {
 		return wire.Endpoint{}, err
 	}
+	root.Protocol = protocol
 	t := root
 	for _, slot := range []int{0, 0, 2} {
 		next, ok, err := t.Table(slot)
@@ -280,12 +301,12 @@ func coordinatorRequests(ctx context.Context, db *DbContext, conn cluster.Connec
 			if protocols {
 				go func() {
 					ep := wire.Endpoint{Addr: addr, Token: wire.WellKnown(tokenProtocolInfo)}
-					v, err := coordinatorCall(ctx, db, ep, wire.Request[uint64](protocolInfoReq{}))
+					v, err := coordinatorProtocol(ctx, db, ep)
 					ch <- coordinatorAnswer{i: i, protocol: true, p: probe{protoOK: err == nil, proto: v}}
 				}()
 			}
 			ep := wire.Endpoint{Addr: addr, Token: wire.WellKnown(tokenGetLeader)}
-			l, err := coordinatorCall(ctx, db, ep, wire.Request[leaderReply](getLeaderReq{[]byte(conn.Key)}))
+			l, err := coordinatorCall(ctx, db, ep, wire.Request[leaderReply](getLeaderReq{key: []byte(conn.Key)}))
 			ch <- coordinatorAnswer{i: i, p: probe{reachable: err == nil, leader: l}}
 		}()
 	}
@@ -406,7 +427,7 @@ func statusLeaderEndpoint(ctx context.Context, db *DbContext, conn cluster.Conne
 			return wire.Endpoint{}, errors.New("no leader")
 		}
 		if !l.forward {
-			return statusEndpoint(l.info)
+			return statusEndpoint(l.info, l.object)
 		}
 		next, err := cluster.ParseConnectionString(string(l.info))
 		if err != nil {

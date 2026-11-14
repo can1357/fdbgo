@@ -1,5 +1,5 @@
-// Package wire implements Flow's ObjectSerializer wire format and every
-// FDB 7.3 and 7.4 RPC message the client sends or receives.
+// Package wire implements Flow's ObjectSerializer wire format and the
+// FoundationDB RPC messages the client sends or receives.
 //
 // The format is FlatBuffers-shaped but schema-less: every server type with a
 // serialize() method is a table whose vtable slots are its serializer()
@@ -37,6 +37,8 @@ type Off = uint32
 // prepended in place afterwards (see Raw). A Builder is reused across messages
 // (callers pool it) and does not allocate once its buffer is large enough.
 type Builder struct {
+	// Protocol selects the upstream serializer layout. Zero preserves 7.4 codec fixtures.
+	Protocol ProtocolVersion
 	buf      []byte
 	head     int
 	minAlign int
@@ -355,9 +357,11 @@ func vecBytes(msg []byte, p int) ([]byte, error) {
 
 // Table is a read-only view of a table inside a message.
 type Table struct {
-	msg     []byte
-	pos, vt int
-	nvt     int
+	// Protocol is inherited by nested tables, fields, and vectors.
+	Protocol ProtocolVersion
+	msg      []byte
+	pos, vt  int
+	nvt      int
 }
 
 func tableAt(msg []byte, pos int) (Table, error) {
@@ -377,16 +381,20 @@ func tableAt(msg []byte, pos int) (Table, error) {
 	if vt+2*nvt > len(msg) {
 		return Table{}, ErrMalformed
 	}
-	return Table{msg, pos, vt, nvt}, nil
+	return Table{msg: msg, pos: pos, vt: vt, nvt: nvt}, nil
 }
 
 // Root returns the synthetic root table of a message.
-func Root(msg []byte) (Table, error) {
+func Root(msg []byte, protocol ...ProtocolVersion) (Table, error) {
 	p, err := le32(msg, 0)
 	if err != nil {
 		return Table{}, err
 	}
-	return tableAt(msg, int(p))
+	t, err := tableAt(msg, int(p))
+	if len(protocol) != 0 {
+		t.Protocol = protocol[0]
+	}
+	return t, err
 }
 
 // field returns the position of slot's value, or -1 when absent.
@@ -512,6 +520,7 @@ func (t Table) Table(slot int) (Table, bool, error) {
 		return Table{}, false, err
 	}
 	sub, err := tableAt(t.msg, p)
+	sub.Protocol = t.Protocol
 	return sub, err == nil, err
 }
 
@@ -528,9 +537,9 @@ func (t Table) mustTable(slot int) (Table, error) {
 func (t Table) Vector(slot int) (Vector, error) {
 	p := t.field(slot)
 	if p < 0 {
-		return Vector{msg: t.msg}, nil
+		return Vector{msg: t.msg, Protocol: t.Protocol}, nil
 	}
-	return Field{t.msg, p}.Vector()
+	return Field{msg: t.msg, pos: p, Protocol: t.Protocol}.Vector()
 }
 
 // Union returns the 1-based alternative of the union slot pair at slot and the
@@ -544,13 +553,14 @@ func (t Table) Union(slot int) (uint8, Field, error) {
 	if tag == 0 || p < 0 {
 		return 0, Field{}, nil
 	}
-	return tag, Field{t.msg, p}, nil
+	return tag, Field{msg: t.msg, pos: p, Protocol: t.Protocol}, nil
 }
 
 // Field is the uoffset field holding a union alternative's value.
 type Field struct {
-	msg []byte
-	pos int
+	Protocol ProtocolVersion
+	msg      []byte
+	pos      int
 }
 
 // Table reads the alternative as a table.
@@ -559,7 +569,9 @@ func (f Field) Table() (Table, error) {
 	if err != nil {
 		return Table{}, err
 	}
-	return tableAt(f.msg, p)
+	t, err := tableAt(f.msg, p)
+	t.Protocol = f.Protocol
+	return t, err
 }
 
 // Bytes reads the alternative as a byte string aliasing the message.
@@ -600,14 +612,15 @@ func (f Field) Vector() (Vector, error) {
 	if err != nil {
 		return Vector{}, err
 	}
-	return Vector{f.msg, p + 4, int(n)}, nil
+	return Vector{msg: f.msg, start: p + 4, n: int(n), Protocol: f.Protocol}, nil
 }
 
 // Vector is a read-only view of a vector inside a message.
 type Vector struct {
-	msg   []byte
-	start int
-	n     int
+	Protocol ProtocolVersion
+	msg      []byte
+	start    int
+	n        int
 }
 
 // Len returns the element count claimed by the message.
@@ -624,7 +637,9 @@ func (v Vector) Table(i int) (Table, error) {
 	if err != nil {
 		return Table{}, err
 	}
-	return tableAt(v.msg, p)
+	t, err := tableAt(v.msg, p)
+	t.Protocol = v.Protocol
+	return t, err
 }
 
 // Bytes returns element i of a vector of byte strings.

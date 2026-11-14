@@ -26,13 +26,12 @@ func TestAtomicAdd(t *testing.T) {
 
 func TestAtomicAndVariants(t *testing.T) {
 	ap(t, MutationAnd, nil, b(0xff, 0xff), 0, 0)
+	ap(t, MutationAnd, b(), b(0xff, 0xff), 0, 0)
+	ap(t, MutationAnd, nil, b())
+	ap(t, MutationAndV2, nil, b())
 	ap(t, MutationAndV2, nil, b(0xff, 0xff), 0xff, 0xff)
 	ap(t, MutationAndV2, b(), b(0xff, 0xff), 0, 0)
 	ap(t, MutationAndV2, b(0x0f, 0xf0, 0xff), b(0xff, 0xff), 0x0f, 0xf0)
-	if normalizeAtomicOp(MutationAnd) != MutationAndV2 || normalizeAtomicOp(MutationMin) != MutationMinV2 ||
-		normalizeAtomicOp(MutationOr) != MutationOr {
-		t.Fatal("normalizeAtomicOp")
-	}
 }
 
 func TestAtomicOrXor(t *testing.T) {
@@ -64,8 +63,89 @@ func TestAtomicMaxMin(t *testing.T) {
 	ap(t, MutationMinV2, b(5), b(4, 1), 5, 0)
 	ap(t, MutationMinV2, b(5, 1), b(6), 5)
 	ap(t, MutationMinV2, nil, b(7, 7), 7, 7)
+	ap(t, MutationMinV2, b(), b(7, 7), 0, 0)
+	ap(t, MutationMinV2, nil, b())
 	ap(t, MutationMin, nil, b(7, 7), 0, 0)
+	ap(t, MutationMin, b(), b(7, 7), 0, 0)
+	ap(t, MutationMin, nil, b())
 	ap(t, MutationMin, b(1), b())
+}
+
+func TestAtomicWireSemanticsWithPendingRead(t *testing.T) {
+	for _, op := range []struct {
+		name          string
+		kind          uint8
+		missing       string
+		populated     string
+		populatedNext string
+	}{
+		{"and", MutationAnd, "\x00\x00", "\x30\x00", "\x10"},
+		{"and_v2", MutationAndV2, "\x3f\x0f", "\x30\x00", "\x10"},
+		{"min", MutationMin, "\x00\x00", "\xf0\x00", "\x17"},
+		{"min_v2", MutationMinV2, "\x3f\x0f", "\xf0\x00", "\x17"},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			for _, state := range []struct {
+				name  string
+				value []byte
+			}{
+				{"missing", nil},
+				{"empty", []byte{}},
+				{"populated", []byte{0xf0, 0x00}},
+			} {
+				t.Run(state.name, func(t *testing.T) {
+					data := map[string][]byte{}
+					if state.value != nil {
+						data["key"] = state.value
+					}
+					db, release := fakeFromMap(data, false).gated(t)
+					r := newRyw()
+					defer r.Cancel()
+					key := []byte("key")
+					r.AtomicOp(key, []byte{0x3f, 0x0f}, op.kind, AtomicOptions{})
+					first := capture(r.Get(db, key, false))
+
+					// Mutate while the earlier read is blocked. Its immutable
+					// write-map view must retain the first operand and wire op.
+					mutated := make(chan struct{})
+					go func() {
+						r.AtomicOp(key, []byte{0x17}, op.kind, AtomicOptions{})
+						close(mutated)
+					}()
+					<-mutated
+					next := capture(r.Get(db, key, false))
+					release()
+
+					wantFirst, wantNext := "\x00\x00", "\x00"
+					switch state.name {
+					case "missing":
+						wantFirst = op.missing
+						if op.kind == MutationAndV2 || op.kind == MutationMinV2 {
+							wantNext = "\x17"
+						}
+					case "populated":
+						wantFirst, wantNext = op.populated, op.populatedNext
+					}
+					eqVal(t, must(t, first), wantFirst, true)
+					eqVal(t, must(t, next), wantNext, true)
+					eqVal(t, must(t, capture(r.Get(db, key, true))), wantNext, true)
+
+					plan := must(t, capture(r.Commit()))
+					eqPairs(t, rangesOf(plan.ReadConflicts), pair{"key", "key\x00"})
+					eqPairs(t, rangesOf(plan.WriteConflicts), pair{"key", "key\x00"})
+					committed := state.value
+					for _, m := range plan.Mutations {
+						if m.Kind == MutationSetValue {
+							committed = m.Param2
+						} else {
+							committed = applyAtomic(m.Kind, committed, m.Param2)
+						}
+					}
+					eqVal(t, committed, wantNext, true)
+				})
+			}
+		})
+	}
 }
 
 func TestAtomicByteMinMax(t *testing.T) {

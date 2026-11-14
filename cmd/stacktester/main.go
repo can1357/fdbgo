@@ -5,6 +5,10 @@
 // bindings. It follows FoundationDB's
 // bindings/bindingtester/spec/bindingApiTester.md and directoryLayerTester.md.
 //
+// The declared API version controls bindingtester formats, not the public Go
+// API: before API 520, versionstamped keys use uint16 offsets and versionstamped
+// values always stamp offset zero. The Go API always uses uint32 offsets.
+//
 // Usage: stacktester <prefix> <api_version> [cluster_file]
 package main
 
@@ -55,6 +59,9 @@ var db *fdb.Database
 // opError carries an fdb error out of an instruction to processInst, which
 // pushes it as a packed ("ERROR", code) tuple like the reference testers.
 type opError struct{ code int }
+
+// operandError distinguishes malformed instruction inputs from tester defects.
+type operandError string
 
 // check aborts the current instruction with err: fdb errors become an error
 // result on the stack, anything else is a tester or binding bug and fatal.
@@ -154,9 +161,10 @@ var (
 	trMap = map[string]*trEntry{}
 )
 
-// StackMachine is one instruction stream: its stack, current transaction
-// name, last seen version, started threads and directory list.
+// StackMachine is one instruction stream: its declared API version, stack,
+// current transaction name, last seen version, started threads and directory list.
 type StackMachine struct {
+	apiVersion  int
 	prefix      []byte
 	trName      string
 	stack       []stackEntry
@@ -166,12 +174,13 @@ type StackMachine struct {
 	verbose     bool
 }
 
-func newStackMachine(prefix []byte) *StackMachine {
+func newStackMachine(prefix []byte, apiVersion int) *StackMachine {
 	sm := &StackMachine{
-		prefix:  prefix,
-		trName:  string(prefix),
-		de:      newDirectoryExtension(),
-		verbose: os.Getenv("STACKTESTER_VERBOSE") != "",
+		apiVersion: apiVersion,
+		prefix:     prefix,
+		trName:     string(prefix),
+		de:         newDirectoryExtension(),
+		verbose:    os.Getenv("STACKTESTER_VERBOSE") != "",
 	}
 	sm.newTransaction()
 	return sm
@@ -310,7 +319,7 @@ func (sm *StackMachine) pushWait(idx int, wait func() any) {
 // waitAndPop pops the top item, resolving it if it is a future.
 func (sm *StackMachine) waitAndPop() stackEntry {
 	if len(sm.stack) == 0 {
-		log.Panicf("pop from empty stack")
+		panic(operandError("pop from empty stack"))
 	}
 	e := sm.stack[len(sm.stack)-1]
 	sm.stack = sm.stack[:len(sm.stack)-1]
@@ -330,8 +339,7 @@ func (sm *StackMachine) popBytes() []byte {
 	case nil:
 		return nil
 	default:
-		log.Panicf("expected bytes, got %T %v", v, v)
-		return nil
+		panic(operandError(fmt.Sprintf("expected bytes, got %T %v", v, v)))
 	}
 }
 
@@ -339,7 +347,7 @@ func (sm *StackMachine) popString() string {
 	v := sm.pop()
 	s, ok := v.(string)
 	if !ok {
-		log.Panicf("expected string, got %T %v", v, v)
+		panic(operandError(fmt.Sprintf("expected string, got %T %v", v, v)))
 	}
 	return s
 }
@@ -358,8 +366,7 @@ func (sm *StackMachine) popInt() int64 {
 			return n.Int64()
 		}
 	}
-	log.Panicf("expected int64, got %T %v", v, v)
-	return 0
+	panic(operandError(fmt.Sprintf("expected int64, got %T %v", v, v)))
 }
 
 func (sm *StackMachine) popSelector() fdb.KeySelector {
@@ -429,6 +436,41 @@ var mutationTypes = map[string]fdb.MutationType{
 	"BYTE_MIN":                 fdb.MutationTypeByteMin,
 	"BYTE_MAX":                 fdb.MutationTypeByteMax,
 	"COMPARE_AND_CLEAR":        fdb.MutationTypeCompareAndClear,
+}
+
+// mutationOperands converts historical bindingtester operands to the Go API's
+// canonical uint32-offset format. Leave malformed operands for Atomic to reject:
+// doing validation here would change deferred errors and their priority.
+func (sm *StackMachine) mutationOperands(mt fdb.MutationType, key, value []byte) ([]byte, []byte) {
+	if sm.apiVersion >= 520 {
+		return key, value
+	}
+	switch mt {
+	case fdb.MutationTypeSetVersionstampedKey:
+		if len(key) >= 2 {
+			canonical := make([]byte, len(key)+2)
+			copy(canonical, key)
+			key = canonical
+		}
+	case fdb.MutationTypeSetVersionstampedValue:
+		canonical := make([]byte, len(value)+4)
+		copy(canonical, value)
+		value = canonical
+	}
+	return key, value
+}
+
+// packWithVersionstamp converts only the output trailer; tuple's public API
+// remains canonical regardless of the tester's declared API version.
+func (sm *StackMachine) packWithVersionstamp(t tuple.Tuple, prefix []byte) ([]byte, error) {
+	packed, err := t.PackWithVersionstamp(prefix)
+	if err != nil || sm.apiVersion >= 520 {
+		return packed, err
+	}
+	if binary.LittleEndian.Uint32(packed[len(packed)-4:]) > math.MaxUint16 {
+		return nil, fmt.Errorf("versionstamp offset exceeds API %d uint16 range", sm.apiVersion)
+	}
+	return packed[:len(packed)-2], nil
 }
 
 // executeMutation applies fn to the current transaction, or with _DATABASE
@@ -685,6 +727,7 @@ func (sm *StackMachine) processInst(idx int, inst tuple.Tuple) {
 		if !ok {
 			log.Panicf("unknown atomic op %q", name)
 		}
+		key, value = sm.mutationOperands(mt, key, value)
 		sm.executeMutation(isDB, idx, func(tr *fdb.Transaction) { tr.Atomic(mt, key, value) })
 	case "READ_CONFLICT_RANGE":
 		check(sm.currentTransaction().AddReadConflictRange(sm.popKeyRange()))
@@ -706,7 +749,7 @@ func (sm *StackMachine) processInst(idx int, inst tuple.Tuple) {
 	case "TUPLE_PACK_WITH_VERSIONSTAMP":
 		prefix := sm.popBytes()
 		t := sm.popTuple(sm.popInt())
-		packed, err := t.PackWithVersionstamp(prefix)
+		packed, err := sm.packWithVersionstamp(t, prefix)
 		switch {
 		case errors.Is(err, tuple.ErrNoIncompleteVersionstamp):
 			sm.push(idx, errorNone)
@@ -772,7 +815,7 @@ func (sm *StackMachine) processInst(idx int, inst tuple.Tuple) {
 		sm.push(idx, binary.BigEndian.AppendUint64(nil, math.Float64bits(f)))
 
 	case "START_THREAD":
-		child := newStackMachine(bytes.Clone(sm.popBytes()))
+		child := newStackMachine(bytes.Clone(sm.popBytes()), sm.apiVersion)
 		sm.threads.Go(child.Run)
 	case "WAIT_EMPTY":
 		r := sm.popPrefixRange()
@@ -862,19 +905,19 @@ func main() {
 		os.Exit(2)
 	}
 	prefix := []byte(os.Args[1])
-	if _, err := strconv.Atoi(os.Args[2]); err != nil {
+	apiVersion, err := strconv.Atoi(os.Args[2])
+	if err != nil {
 		log.Fatalf("api version %q: %v", os.Args[2], err)
 	}
 	clusterFile := ""
 	if len(os.Args) > 3 {
 		clusterFile = os.Args[3]
 	}
-	var err error
 	db, err = fdb.Open(clusterFile)
 	if err != nil {
 		log.Fatalf("open %q: %v", clusterFile, err)
 	}
-	newStackMachine(prefix).Run()
+	newStackMachine(prefix, apiVersion).Run()
 	if err := db.Close(); err != nil {
 		log.Fatalf("close: %v", err)
 	}

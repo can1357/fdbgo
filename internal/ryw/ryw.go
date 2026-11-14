@@ -443,22 +443,21 @@ func (r *Ryw) ClearRange(begin, end []byte) bool {
 	return false
 }
 
-// AtomicOp performs an atomic operation given its wire mutation type; readVersion, if
-// haveReadVersion, is the native transaction's read version when already
-// known (placeholder versionstamps). Errors are deferred.
-func (r *Ryw) AtomicOp(key, param []byte, wireOp uint8, readVersion int64, haveReadVersion bool) {
+// AtomicOp applies the selected wire operation and captured operand rules.
+// Errors are deferred; options controls local versionstamp placeholders.
+func (r *Ryw) AtomicOp(key, param []byte, wireOp uint8, options AtomicOptions) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.deferredErr != nil {
 		return
 	}
-	if err := r.atomicOp(key, param, wireOp, readVersion, haveReadVersion); err != nil {
+	if err := r.atomicOp(key, param, wireOp, options); err != nil {
 		r.deferredErr = err
 	}
 }
 
-func (r *Ryw) atomicOp(key, param []byte, wireOp uint8, readVersion int64, haveReadVersion bool) error {
-	w, err := validateAtomicOp(&r.options, key, param, wireOp, readVersion, haveReadVersion, r.usedDuringCommit)
+func (r *Ryw) atomicOp(key, param []byte, wireOp uint8, options AtomicOptions) error {
+	w, err := validateAtomicOp(&r.options, key, param, wireOp, options, r.usedDuringCommit)
 	if err != nil {
 		return err
 	}
@@ -473,7 +472,8 @@ func (r *Ryw) atomicOp(key, param []byte, wireOp uint8, readVersion int64, haveR
 	}
 	r.approxSize += approxAtomic(key, w.key, param, w.addConflict)
 	if r.options.ReadYourWritesDisabled {
-		return r.nativeAtomic(w.key, param, w.op, w.addConflict)
+		r.nativeAtomic(w.key, param, w.op, w.addConflict)
+		return nil
 	}
 	if err := r.writes.mutate(w.key, w.op, dup(param), w.addConflict); err != nil {
 		return err
@@ -670,19 +670,14 @@ func (r *Ryw) nativeClearRange(begin, end []byte, addConflict bool) {
 	r.nativeMutations = append(r.nativeMutations, wire.Mutation{Kind: MutationClearRange, Param1: kr.Begin, Param2: kr.End})
 }
 
-// nativeAtomic records an atomic operation directly in the native lists;
-// versionstamped keys get their conflict range from the
-// commit proxy.
-func (r *Ryw) nativeAtomic(key, param []byte, op uint8, addConflict bool) error {
-	if err := validateSetSizes(&r.options, key, param); err != nil {
-		return err
-	}
+// nativeAtomic records a validated atomic operation. Canonical versionstamp
+// trailers can exceed ordinary stored-key/value limits until wire conversion.
+func (r *Ryw) nativeAtomic(key, param []byte, op uint8, addConflict bool) {
 	k := dup(key)
 	if addConflict && op != MutationSetVersionstampedKey {
 		r.nativeWriteConflicts = append(r.nativeWriteConflicts, kv.KeyRange{Begin: k, End: kv.KeyAfter(k)})
 	}
-	r.nativeMutations = append(r.nativeMutations, wire.Mutation{Kind: normalizeAtomicOp(op), Param1: k, Param2: dup(param)})
-	return nil
+	r.nativeMutations = append(r.nativeMutations, wire.Mutation{Kind: op, Param1: k, Param2: dup(param)})
 }
 
 // nativeWriteConflict records a native write conflict range. Its callers
@@ -735,14 +730,18 @@ func (r *Ryw) writeRangeToNative(begin, end []byte) error {
 				case m.kind == MutationSetValue && m.value == nil:
 					r.nativeClearKey(key, false)
 				case m.kind == MutationSetValue || isAtomicOp(m.kind):
-					if err := validateSetSizes(&r.options, key, m.value); err != nil {
-						return err
+					// Versionstamp operands were checked at issue time against
+					// their wire-format limits, not ordinary stored-value limits.
+					if m.kind != MutationSetVersionstampedKey && m.kind != MutationSetVersionstampedValue {
+						if err := validateSetSizes(&r.options, key, m.value); err != nil {
+							return err
+						}
 					}
 					// Write-map entries own immutable bytes, including
 					// across later mutations and resets. Native callers
 					// still copy their inputs through nativeSet/Atomic.
 					r.nativeMutations = append(r.nativeMutations, wire.Mutation{
-						Kind: normalizeAtomicOp(m.kind), Param1: key, Param2: m.value,
+						Kind: m.kind, Param1: key, Param2: m.value,
 					})
 				}
 			}

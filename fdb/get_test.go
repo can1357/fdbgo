@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/can1357/fdbgo/internal/wire"
 )
 
 func TestSetGet(t *testing.T) {
@@ -284,6 +286,31 @@ func TestVersionstampWithoutSuccessfulCommit(t *testing.T) {
 	}
 	if _, err := tr.Versionstamp(); !errors.Is(err, ErrTransactionInvalidVersion) {
 		t.Fatalf("failed commit versionstamp = %v; want transaction_invalid_version", err)
+	}
+}
+
+func TestApproximateSizeHistoricalDeferredError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := testCtx(t)
+	tr := mustTr(t, db)
+	defer tr.Close()
+	tr.Set(key(testPrefix(t, db), "value"), []byte("value"))
+	version, err := tr.ReadVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.SetReadVersion(version)
+	size, err := tr.ApproximateSize(ctx)
+	if serverBefore(t, db, wire.Protocol72) {
+		if err != nil || size <= 0 {
+			t.Fatalf("historical approximate size = %d, %v; want retained size", size, err)
+		}
+	} else if !errors.Is(err, ErrReadVersionAlreadySet) {
+		t.Fatalf("approximate size = %d, %v; want read_version_already_set", size, err)
+	}
+	// Ignoring the error for size must never clear it for a commit.
+	if err := tr.Commit(ctx); !errors.Is(err, ErrReadVersionAlreadySet) {
+		t.Fatalf("commit after size = %v; want read_version_already_set", err)
 	}
 }
 

@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zeebo/xxh3"
 
@@ -23,25 +25,32 @@ type fakeServer struct {
 	version uint64
 	// connectLen is the length field of the server's ConnectPacket.
 	connectLen uint32
-	tlsConfig  *tls.Config
-	handle     func(s *serverConn, dest wire.UID, msg []byte)
+	// closeMismatch models 5.0, which closes before replying to unknown versions.
+	closeMismatch bool
+	mismatchBytes chan int
+	tlsConfig     *tls.Config
+	handle        func(s *serverConn, dest wire.UID, msg []byte)
 
-	mu     sync.Mutex
-	conns  []*serverConn
-	hellos []uint64
-	wg     sync.WaitGroup
+	mu           sync.Mutex
+	conns        []*serverConn
+	hellos       []uint64
+	helloLengths []uint32
+	wg           sync.WaitGroup
 }
 
 // serverConn is one accepted connection of a fakeServer.
 type serverConn struct {
-	nc       net.Conn
-	checksum bool
-	r        *bufio.Reader
-	mu       sync.Mutex
-	w        *bufio.Writer
-	b        wire.Builder
-	frame    []byte
-	hdr      [12]byte
+	nc            net.Conn
+	protocol      wire.ProtocolVersion
+	object        bool
+	checksum      bool
+	checksumBytes int
+	r             *bufio.Reader
+	mu            sync.Mutex
+	w             *bufio.Writer
+	b             wire.Builder
+	frame         []byte
+	hdr           [12]byte
 }
 
 // newFakeServer listens on loopback; handle defaults to answerPings.
@@ -110,15 +119,35 @@ func (fs *fakeServer) serve(nc net.Conn) {
 	fs.conns = append(fs.conns, s)
 	fs.mu.Unlock()
 	defer nc.Close()
-	var hello [4 + connectPacketLen]byte
-	if _, err := io.ReadFull(s.r, hello[:]); err != nil {
+	var hello [4 + 1024]byte
+	if _, err := io.ReadFull(s.r, hello[:4]); err != nil {
+		return
+	}
+	helloLength := binary.LittleEndian.Uint32(hello[:4])
+	if helloLength < 8 || helloLength > 1024 {
+		return
+	}
+	if _, err := io.ReadFull(s.r, hello[4:4+helloLength]); err != nil {
 		return
 	}
 	advertised := binary.LittleEndian.Uint64(hello[4:])
 	fs.mu.Lock()
 	version := fs.version
 	fs.hellos = append(fs.hellos, advertised)
+	fs.helloLengths = append(fs.helloLengths, helloLength)
 	fs.mu.Unlock()
+	s.protocol = wire.ProtocolVersion(version & versionMask)
+	s.object = version&objectSerializerFlag != 0
+	s.checksum = fs.tlsConfig == nil || s.protocol.Normalized() < wire.ProtocolVersion(0x0FDB00A551040000)
+	if s.checksum {
+		s.checksumBytes = 8
+		if s.protocol.Normalized() < wire.ProtocolVersion(0x0FDB00B070010000) {
+			s.checksumBytes = 4
+		}
+	}
+	if fs.closeMismatch && !wire.ProtocolVersion(advertised).Compatible(s.protocol) {
+		return
+	}
 	reply := make([]byte, 4+int(max(fs.connectLen, 8)))
 	binary.LittleEndian.PutUint32(reply[0:], fs.connectLen)
 	binary.LittleEndian.PutUint64(reply[4:], version)
@@ -127,13 +156,16 @@ func (fs *fakeServer) serve(nc net.Conn) {
 	}
 	// A real FlowTransport peer never accepts ordinary RPCs after an
 	// incompatible initial advertisement, even if the client changes codecs.
-	if advertised&objectSerializerFlag == 0 || !wire.ProtocolVersion(advertised).Compatible(wire.ProtocolVersion(version)) {
+	if (advertised^version)&objectSerializerFlag != 0 || !wire.ProtocolVersion(advertised).Compatible(wire.ProtocolVersion(version)) {
+		if fs.mismatchBytes != nil {
+			_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+			var b [1]byte
+			n, _ := s.r.Read(b[:])
+			fs.mismatchBytes <- n
+		}
 		return
 	}
-	hdrLen := 4
-	if s.checksum {
-		hdrLen = 12
-	}
+	hdrLen := 4 + s.checksumBytes
 	var hdr [12]byte
 	var buf []byte
 	for {
@@ -141,6 +173,9 @@ func (fs *fakeServer) serve(nc net.Conn) {
 			return
 		}
 		n := int(binary.LittleEndian.Uint32(hdr[:]))
+		if n < 16 || n > packetLimit {
+			return
+		}
 		if cap(buf) < n {
 			buf = make([]byte, n)
 		}
@@ -148,10 +183,19 @@ func (fs *fakeServer) serve(nc net.Conn) {
 		if _, err := io.ReadFull(s.r, pkt); err != nil {
 			return
 		}
-		if s.checksum && xxh3.Hash(pkt) != binary.LittleEndian.Uint64(hdr[4:]) {
-			panic("client sent a bad checksum")
+		if s.checksumBytes == 8 && xxh3.Hash(pkt) != binary.LittleEndian.Uint64(hdr[4:]) {
+			panic("client sent a bad XXH3 checksum")
+		}
+		if s.checksumBytes == 4 && crc32.Checksum(pkt, crc32cTable) != binary.LittleEndian.Uint32(hdr[4:]) {
+			panic("client sent a bad CRC32C checksum")
 		}
 		dest := wire.UID{First: binary.LittleEndian.Uint64(pkt[0:]), Second: binary.LittleEndian.Uint64(pkt[8:])}
+		// From 7.0, ordinary receivers use RequirePeer::Exactly, which includes
+		// patch bits. Ping uses AtLeast and can keep a mismatched socket alive.
+		if s.protocol.Normalized() >= wire.Protocol70.Normalized() &&
+			advertised&versionMask != version&versionMask && dest != wire.WellKnown(wire.TokenPing) {
+			continue
+		}
 		fs.handle(s, dest, pkt[16:])
 		if s.r.Buffered() == 0 {
 			s.mu.Lock()
@@ -169,15 +213,19 @@ func (s *serverConn) send(dest wire.UID, build func(b *wire.Builder) []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.b.Reset()
+	s.b.Protocol = s.protocol
 	msg := build(&s.b)
 	s.frame = binary.LittleEndian.AppendUint64(s.frame[:0], dest.First)
 	s.frame = binary.LittleEndian.AppendUint64(s.frame, dest.Second)
 	s.frame = append(s.frame, msg...)
 	hdr := s.hdr[:]
 	binary.LittleEndian.PutUint32(hdr, uint32(len(s.frame)))
-	if s.checksum {
+	if s.checksumBytes == 8 {
 		binary.LittleEndian.PutUint64(hdr[4:], xxh3.Hash(s.frame))
 		s.w.Write(hdr)
+	} else if s.checksumBytes == 4 {
+		binary.LittleEndian.PutUint32(hdr[4:], crc32.Checksum(s.frame, crc32cTable))
+		s.w.Write(hdr[:8])
 	} else {
 		s.w.Write(hdr[:4])
 	}
@@ -193,12 +241,18 @@ func (s *serverConn) flush() error {
 
 // answerPings replies Void to every PingRequest, whatever its destination.
 func answerPings(s *serverConn, _ wire.UID, msg []byte) {
-	if reply, err := wire.PingReplyToken(msg); err == nil {
-		s.send(reply, wire.EncodeVoidReply)
+	if s.object {
+		if reply, err := wire.PingReplyToken(msg, s.protocol); err == nil {
+			s.send(reply, wire.EncodeVoidReply)
+		}
+	} else if reply, err := wire.PingReplyTokenLegacy(msg, s.protocol); err == nil {
+		s.send(reply, func(b *wire.Builder) []byte {
+			return wire.EncodeVoidReplyLegacy(b, s.protocol)
+		})
 	}
 }
 
-// errorReply writes ErrorOr<T> carrying error code.
+// errorReply writes ErrorOr<Void> carrying error code.
 func errorReply(code fdberr.Error) func(b *wire.Builder) []byte {
 	return func(b *wire.Builder) []byte {
 		b.StartTable(1)
@@ -207,7 +261,12 @@ func errorReply(code fdberr.Error) func(b *wire.Builder) []byte {
 		b.StartTable(2)
 		b.AddUnion(0, 1, e)
 		root := b.EndTable()
-		return b.Finish(root, wire.FIDErrorOr|wire.FIDVoid)
+		prefix := wire.FIDErrorOr
+		if b.Protocol != 0 && b.Protocol.Normalized() < wire.Protocol70.Normalized() {
+			// flow.h: ErrorOr composed identifier was 1 before 7.0.
+			prefix = 1 << 24
+		}
+		return b.Finish(root, prefix|wire.FIDVoid)
 	}
 }
 
@@ -233,6 +292,6 @@ func paddedVoidReply(pad int) func(b *wire.Builder) []byte {
 func pingRequest(reply wire.UID) func(b *wire.Builder) []byte {
 	return func(b *wire.Builder) []byte {
 		off := wire.Ping{}.Encode(b, reply)
-		return b.FinishRequest(off, wire.Ping{}.FileID())
+		return b.FinishRequest(off, wire.MessageFileID(wire.Ping{}, b.Protocol))
 	}
 }

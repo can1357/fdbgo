@@ -126,6 +126,16 @@ func (de *directoryExtension) processOp(sm *StackMachine, op string, isDB, isSna
 // run executes one directory instruction. Every error, fdb errors included,
 // is reported as DIRECTORY_ERROR by processOp.
 func (de *directoryExtension) run(sm *StackMachine, op string, isDB, isSnapshot bool, idx int) (err error) {
+	defer func() {
+		if failure := recover(); failure != nil {
+			switch failure := failure.(type) {
+			case operandError:
+				err = errDirectory(failure)
+			default:
+				panic(failure)
+			}
+		}
+	}()
 	// t is the transactor of operations that write: the database retries
 	// and commits, the current transaction runs once. rt reads, through the
 	// snapshot view for _SNAPSHOT.

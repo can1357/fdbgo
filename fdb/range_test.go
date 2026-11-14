@@ -9,6 +9,7 @@ import (
 
 	"github.com/can1357/fdbgo/internal/client"
 	"github.com/can1357/fdbgo/internal/kv"
+	"github.com/can1357/fdbgo/internal/wire"
 	"github.com/can1357/fdbgo/subspace"
 	"github.com/can1357/fdbgo/tuple"
 )
@@ -257,6 +258,9 @@ func TestRangeSplitPoints(t *testing.T) {
 	mustCommit(t, ctx, tr)
 	r := prefixRange(t, p)
 	splits, err := mustTr(t, db).RangeSplitPoints(ctx, r, 100)
+	if unavailableBefore(t, db, err, wire.Protocol70) {
+		return
+	}
 	if err != nil || len(splits) == 0 {
 		t.Fatalf("splits = %q, %v", splits, err)
 	}
@@ -372,6 +376,9 @@ func TestMappedValue(t *testing.T) {
 	}
 	tr := mustTr(t, db)
 	rows, err := sliceMappedRange(ctx, tr, blueIndex, m.mapper, RangeOptions{})
+	if unavailableBefore(t, db, err, wire.Protocol71) {
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,8 +407,15 @@ func TestMappedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr := mustTr(t, db)
+	result, err := tr.GetMappedRange(ctx, blueIndex, m.mapper, RangeOptions{})
+	if unavailableBefore(t, db, err, wire.Protocol71) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	var rows []MappedKeyValue
-	for row, err := range mustMappedRange(t, ctx, tr, blueIndex, m.mapper, RangeOptions{}).All(ctx) {
+	for row, err := range result.All(ctx) {
 		if err != nil {
 			t.Fatal(err)
 		}

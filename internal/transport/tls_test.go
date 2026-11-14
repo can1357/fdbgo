@@ -14,6 +14,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -1024,6 +1025,27 @@ func TestConnectOverTLS(t *testing.T) {
 		}
 	}
 	checkAdvertisements(t, older, wire.Protocol74, wire.Protocol73)
+
+	for _, version := range []wire.ProtocolVersion{wire.Protocol50, wire.Protocol51, wire.Protocol61, wire.Protocol62, wire.Protocol63, wire.Protocol70, wire.Protocol80} {
+		t.Run(fmt.Sprintf("version-%x", version), func(t *testing.T) {
+			peer := newFakeServer(t, nil)
+			peer.tlsConfig = fs.tlsConfig
+			peer.version = uint64(version)
+			if version.UsesObjectSerializer() {
+				peer.version |= objectSerializerFlag
+			}
+			peer.closeMismatch = version.Compatible(wire.Protocol50)
+			peer.start()
+			conn := connect(t, peer)
+			wantChecksum := version.Compatible(wire.Protocol50)
+			if conn.checksum != wantChecksum {
+				t.Fatalf("TLS checksum enabled=%v, want %v", conn.checksum, wantChecksum)
+			}
+			if err := call(conn, echoTok); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 
 	c.setVerifyPeers([]byte("S.CN=someone-else"))
 	withNetworkTLS(t, c)

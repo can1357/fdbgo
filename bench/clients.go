@@ -1,6 +1,6 @@
 package main
 
-// #define FDB_API_VERSION 730
+// #define FDB_API_VERSION 500
 // #include <foundationdb/fdb_c.h>
 import "C"
 
@@ -25,10 +25,11 @@ func openKV(c config) (kv, error) {
 	}
 	// build.sh pairs the Go wrapper with the installed SDK; use the highest
 	// runtime API supported by that SDK, capped at the versions we exercise.
-	if err := cfdb.APIVersion(min(740, int(C.fdb_get_max_api_version()))); err != nil {
+	if err := cfdb.APIVersion(min(800, int(C.fdb_get_max_api_version()))); err != nil {
 		return nil, err
 	}
-	db, err := cfdb.OpenDatabase(c.cluster)
+	// OpenDatabase was introduced in 6.1; Open is present in every pinned wrapper.
+	db, err := cfdb.Open(c.cluster, []byte("DB"))
 	return cgoKV{db}, err
 }
 

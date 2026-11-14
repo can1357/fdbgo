@@ -12,7 +12,7 @@ const (
 	MutationClearRange uint8 = 1
 	// MutationAddValue is the add atomic operation.
 	MutationAddValue uint8 = 2
-	// MutationAnd is the legacy bit_and operation, rewritten to MutationAndV2.
+	// MutationAnd is legacy bit_and; a missing value counts as zero bytes.
 	MutationAnd uint8 = 6
 	// MutationOr is the bit_or atomic operation.
 	MutationOr uint8 = 7
@@ -22,7 +22,7 @@ const (
 	MutationAppendIfFits uint8 = 9
 	// MutationMax is the max atomic operation.
 	MutationMax uint8 = 12
-	// MutationMin is the legacy min operation, rewritten to MutationMinV2.
+	// MutationMin is legacy min; a missing value counts as zero bytes.
 	MutationMin uint8 = 13
 	// MutationSetVersionstampedKey is the set_versionstamped_key atomic operation.
 	MutationSetVersionstampedKey uint8 = 14
@@ -32,9 +32,9 @@ const (
 	MutationByteMin uint8 = 16
 	// MutationByteMax is the byte_max atomic operation.
 	MutationByteMax uint8 = 17
-	// MutationMinV2 is the min atomic operation.
+	// MutationMinV2 is min where a missing value yields the operand.
 	MutationMinV2 uint8 = 18
-	// MutationAndV2 is the bit_and atomic operation.
+	// MutationAndV2 is bit_and where a missing value yields the operand.
 	MutationAndV2 uint8 = 19
 	// MutationCompareAndClear is the compare_and_clear atomic operation.
 	MutationCompareAndClear uint8 = 20
@@ -44,18 +44,6 @@ const (
 
 // appendIfFitsLimit is the value size limit AppendIfFits keeps its result within.
 const appendIfFitsLimit = 100_000
-
-// normalizeAtomicOp rewrites legacy ops as clients at API version >= 510 do
-// (Min->MinV2, And->AndV2).
-func normalizeAtomicOp(op uint8) uint8 {
-	switch op {
-	case MutationMin:
-		return MutationMinV2
-	case MutationAnd:
-		return MutationAndV2
-	}
-	return op
-}
 
 // dup copies b into a new, never nil slice: a present value.
 func dup(b []byte) []byte {

@@ -18,6 +18,20 @@ modfile=$moddir/go.mod
 trap 'rm -rf "$moddir"' EXIT
 cp go.mod "$modfile"
 cp go.sum "${modfile%.mod}.sum"
-go mod edit -modfile "$modfile" "-replace=github.com/apple/foundationdb/bindings/go=$S/bindings/go"
+reference=$S/bindings/go
+if [[ ! -f $reference/go.mod || ! -f $reference/src/fdb/generated.go ]]; then
+	# 5.0–6.0 predate modules. 5.0 also generates its Go options at build time
+	# (bindings/go/include.mk). Adapt only the temporary build input, not the
+	# pinned source tree or the checked-in bench module.
+	mkdir -p "$moddir/reference/src/fdb"
+	cp "$reference/src/fdb/"*.go "$moddir/reference/src/fdb/"
+	if [[ ! -f $reference/src/fdb/generated.go ]]; then
+		go run "$reference/src/_util/translate_fdb_options.go" \
+			< "$S/fdbclient/vexillographer/fdb.options" > "$moddir/reference/src/fdb/generated.go"
+	fi
+	reference=$moddir/reference
+	printf 'module github.com/apple/foundationdb/bindings/go\n\ngo 1.27\n' > "$reference/go.mod"
+fi
+go mod edit -modfile "$modfile" "-replace=github.com/apple/foundationdb/bindings/go=$reference"
 CGO_CFLAGS="-I$R/include" CGO_LDFLAGS="-L$R/lib -Wl,-rpath,$R/lib" \
-	go build -modfile "$modfile" -o fdbbench . 2> >(grep -v 'duplicate -rpath' >&2)
+	go build -mod=mod -modfile "$modfile" -o fdbbench . 2> >(grep -v 'duplicate -rpath' >&2)

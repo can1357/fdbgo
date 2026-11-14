@@ -77,13 +77,16 @@ func TestWriteLoopBatches(t *testing.T) {
 				client, server := net.Pipe()
 				defer server.Close()
 				c := &Connection{
-					raw:      client,
-					rw:       client,
-					checksum: checksum,
-					closed:   make(chan struct{}),
-					done:     make(chan struct{}),
-					wake:     make(chan struct{}, 1),
-					created:  time.Now(),
+					raw:           client,
+					rw:            client,
+					checksum:      checksum,
+					protocol:      wire.Protocol74,
+					object:        true,
+					checksumBytes: map[bool]int{false: 0, true: 8}[checksum],
+					closed:        make(chan struct{}),
+					done:          make(chan struct{}),
+					wake:          make(chan struct{}, 1),
+					created:       time.Now(),
 				}
 				defer c.Close()
 				c.workers.Store(1)
@@ -358,7 +361,7 @@ func TestBadChecksumFailsConnection(t *testing.T) {
 // pipeServer serves the client end of a net.Pipe inside a synctest bubble;
 // it answers pings when answer is set.
 func pipeServer(nc net.Conn, answer bool) {
-	s := &serverConn{nc: nc, checksum: true, w: bufio.NewWriter(nc)}
+	s := &serverConn{nc: nc, protocol: wire.Protocol74, object: true, checksum: true, checksumBytes: 8, w: bufio.NewWriter(nc)}
 	defer nc.Close()
 	var hdr [12]byte
 	for {
@@ -473,6 +476,10 @@ func TestDevClusterHandshake(t *testing.T) {
 	c, err := Connect(ctx, addr)
 	if err != nil {
 		t.Fatalf("connect %v: %v", addr, err)
+	}
+	if mode := os.Getenv("FDB_OBJECT_SERIALIZER"); mode != "" && c.UsesObjectSerializer() != (mode == "1") {
+		c.Close()
+		t.Fatalf("object serializer = %v; requested mode %s", c.UsesObjectSerializer(), mode)
 	}
 	defer c.Close()
 	if _, err := Call(ctx, c, wire.WellKnown(wire.TokenPing), wire.Ping{}); err != nil {

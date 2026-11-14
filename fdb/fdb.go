@@ -1,4 +1,4 @@
-// Package fdb is a pure-Go FoundationDB 7.3 and 7.4 client. It speaks FlowTransport
+// Package fdb is a pure-Go FoundationDB 5.0–8.0 client. It speaks FlowTransport
 // to the cluster itself instead of linking libfdb_c, with the semantics of
 // the C client.
 //

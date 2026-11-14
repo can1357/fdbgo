@@ -29,6 +29,16 @@ const (
 // emptyKey is the present empty key.
 var emptyKey = []byte{}
 
+// AtomicOptions captures read-version and operand-format details at the client boundary.
+type AtomicOptions struct {
+	// ReadVersion is used for local versionstamp placeholders when HasReadVersion.
+	ReadVersion    int64
+	HasReadVersion bool
+	// LegacyVersionstamps accounts for canonical trailers that disappear or
+	// shrink on 5.0/5.1, without widening ordinary key/value limits.
+	LegacyVersionstamps bool
+}
+
 // RywOptions are the transaction options the read-your-writes layer
 // interprets itself, plus raw_access for key size limits.
 type RywOptions struct {
@@ -224,7 +234,7 @@ type atomicWrite struct {
 	// key is a copy of the key to write: the template with a placeholder
 	// versionstamp for SetVersionstampedKey.
 	key []byte
-	// op is the wire mutation type, legacy Min/And rewritten.
+	// op is the wire mutation type selected by the client.
 	op          uint8
 	addConflict bool
 	// For SetVersionstampedKey: the untransformed template and the range it may land in.
@@ -308,7 +318,7 @@ func validateClear(o *RywOptions, key []byte, usedDuringCommit func() bool) (wri
 
 // validateAtomicOp performs the checks and key rewriting of AtomicOp that
 // apply with and without read-your-writes.
-func validateAtomicOp(o *RywOptions, key, param []byte, wireOp uint8, readVersion int64, haveReadVersion bool,
+func validateAtomicOp(o *RywOptions, key, param []byte, wireOp uint8, a AtomicOptions,
 	usedDuringCommit func() bool) (atomicWrite, error) {
 	addConflict := !o.takeWriteConflictDisabled()
 	if usedDuringCommit() {
@@ -324,20 +334,29 @@ func validateAtomicOp(o *RywOptions, key, param []byte, wireOp uint8, readVersio
 	if wireOp >= MutationMaxAtomicOp || !isAtomicOp(wireOp) {
 		return atomicWrite{}, fdberr.InvalidMutationType
 	}
-	if len(key) > maxWriteKeySize(key, o.RawAccess) {
+	keyLimit, valueLimit := maxWriteKeySize(key, o.RawAccess && !a.LegacyVersionstamps), kv.ValueSizeLimit
+	if a.LegacyVersionstamps {
+		switch wireOp {
+		case MutationSetVersionstampedKey:
+			keyLimit += 2
+		case MutationSetVersionstampedValue:
+			valueLimit += 4
+		}
+	}
+	if len(key) > keyLimit {
 		return atomicWrite{}, fdberr.KeyTooLarge
 	}
-	if len(param) > kv.ValueSizeLimit {
+	if len(param) > valueLimit {
 		return atomicWrite{}, fdberr.ValueTooLarge
 	}
-	w := atomicWrite{op: normalizeAtomicOp(wireOp)}
+	w := atomicWrite{op: wireOp}
 	if w.op == MutationSetVersionstampedKey {
-		r, err := versionstampKeyRange(key, readVersion, haveReadVersion, o.MaxReadKey())
+		r, err := versionstampKeyRange(key, a.ReadVersion, a.HasReadVersion, o.MaxReadKey())
 		if err != nil {
 			return atomicWrite{}, err
 		}
 		addConflict = false
-		k, err := transformVersionstampKey(key, placeholderVersion(readVersion, haveReadVersion), 0)
+		k, err := transformVersionstampKey(key, placeholderVersion(a.ReadVersion, a.HasReadVersion), 0)
 		if err != nil {
 			return atomicWrite{}, err
 		}

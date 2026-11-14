@@ -44,27 +44,28 @@ jobs:
         run: go test -race -count=1 -timeout=5m ./...
 
   integration:
-    name: FoundationDB ${{ matrix.fdb.version }}
+    name: FoundationDB ${{ matrix.fdb }} (Linux amd64)
     strategy:
       fail-fast: false
       matrix:
+        # Exact binary checksums, source commits, API versions and adjacent
+        # upgrade targets are centralized in scripts/fdb-releases.tsv.
         fdb:
-          - version: 7.3.81
-            api: 730
-            source: d40f65d20e4ac102c788e9bdec4160c1c1306dd3
-          - version: 7.4.8
-            api: 740
-            source: 3ce230b696166af33e55aae95c54a185a761981e
+          - '5.0.8'
+          - '5.1.7'
+          - '5.2.8'
+          - '6.0.18'
+          - '6.1.13'
+          - '6.2.30'
+          - '6.3.25'
+          - '7.0.0'
+          - '7.1.67'
+          - '7.2.9'
+          - '7.3.81'
+          - '7.4.8'
+          - '8.0.0'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      FDB_VERSION: ${{ matrix.fdb.version }}
-      FDB_API_VERSION: ${{ matrix.fdb.api }}
-      FDB_ROOT: ${{ github.workspace }}/target/fdb-${{ matrix.fdb.version }}
-      FDB_BIN: ${{ github.workspace }}/target/fdb-${{ matrix.fdb.version }}/bin
-      FDB_SOURCE_DIR: ${{ github.workspace }}/target/fdb-${{ matrix.fdb.version }}/src
-      FDB_RUN: ${{ github.workspace }}/run/ci-${{ matrix.fdb.version }}
-      FDB_CLUSTER_FILE: ${{ github.workspace }}/run/ci-${{ matrix.fdb.version }}/fdb.cluster
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,61 +77,12 @@ jobs:
             go.sum
             bench/go.sum
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - name: Check out FoundationDB reference bindings
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: apple/foundationdb
-          ref: ${{ matrix.fdb.source }}
-          path: target/fdb-${{ matrix.fdb.version }}/src
-          persist-credentials: false
-      - name: Download FoundationDB
-        shell: bash
+          version: '0.10.12'
+      - name: Install historical reference build prerequisites
         run: |
-          set -euo pipefail
-          mkdir -p "$FDB_ROOT"/{bin,lib,include,dl}
-          printf 'module ignored\n' > target/go.mod
-          cd "$FDB_ROOT/dl"
-          base="https://github.com/apple/foundationdb/releases/download/$FDB_VERSION"
-          for asset in fdbserver.x86_64 "foundationdb-clients_${FDB_VERSION}-1_amd64.deb"; do
-            curl -fsSLO "$base/$asset"
-            curl -fsSLO "$base/$asset.sha256"
-            printf '%s  %s\n' "$(awk '{print $1}' "$asset.sha256")" "$asset" | sha256sum --check --status
-          done
-          install -m 755 fdbserver.x86_64 ../bin/fdbserver
-          dpkg-deb --extract "foundationdb-clients_${FDB_VERSION}-1_amd64.deb" ../sdk
-          install -m 755 ../sdk/usr/bin/fdbcli ../bin/fdbcli
-          install -m 755 ../sdk/usr/lib/libfdb_c.so ../lib/libfdb_c.so
-          cp -R ../sdk/usr/include/foundationdb ../include/
-      - name: Start isolated cluster
-        run: scripts/cluster.sh up 1 memory
-      - name: Integration tests with race detector
-        run: go test -race -count=1 -timeout=5m ./...
-      - name: Build benchmark against the C client
-        run: bench/build.sh
-      - name: Compare against reference binding
-        run: scripts/bindingtester.sh full 1
-      - name: Download upgrade target
-        if: matrix.fdb.version == '7.3.81'
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libffi-dev zlib1g-dev xz-utils
+      - name: Full functional, reference-binding and adjacent-upgrade checks
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/fdb-upgrade/{bin,dl}
-          cd target/fdb-upgrade/dl
-          base=https://github.com/apple/foundationdb/releases/download/7.4.8
-          for asset in fdbserver.x86_64 foundationdb-clients_7.4.8-1_amd64.deb; do
-            curl -fsSLO "$base/$asset"
-            curl -fsSLO "$base/$asset.sha256"
-            printf '%s  %s\n' "$(awk '{print $1}' "$asset.sha256")" "$asset" | sha256sum --check --status
-          done
-          install -m 755 fdbserver.x86_64 ../bin/fdbserver
-          dpkg-deb --extract foundationdb-clients_7.4.8-1_amd64.deb ../sdk
-          install -m 755 ../sdk/usr/bin/fdbcli ../bin/fdbcli
-      - name: Upgrade persisted data from 7.3 to 7.4
-        if: matrix.fdb.version == '7.3.81'
-        env:
-          FDB_UPGRADE_FROM: ${{ env.FDB_ROOT }}
-          FDB_UPGRADE_TO: ${{ github.workspace }}/target/fdb-upgrade
-        run: go test -race -count=1 -timeout=5m ./fdb -run '^TestMultiVersionUpgrade$'
-      - name: Stop cluster
-        if: always()
-        run: scripts/cluster.sh down
+        run: scripts/test-versions.sh '${{ matrix.fdb }}'

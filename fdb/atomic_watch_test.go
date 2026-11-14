@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/can1357/fdbgo/internal/wire"
 )
 
 // setTestOptions gives tr a 30-second timeout.
@@ -62,6 +64,34 @@ func TestAtomic(t *testing.T) {
 	})
 	if err != nil || len(v) != 8 || binary.LittleEndian.Uint64(v) != 0 {
 		t.Fatalf("counter = %x, %v; want 0", v, err)
+	}
+}
+
+func TestAppendIfFitsHistoricalValidation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := testCtx(t)
+	k := key(testPrefix(t, db), "append")
+	tr := mustTr(t, db)
+	defer tr.Close()
+	if _, err := tr.ReadVersion(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tr.AppendIfFits(k, []byte("value"))
+	err := tr.Commit(ctx)
+	if serverBefore(t, db, wire.Protocol52) {
+		if !errors.Is(err, ErrInvalidMutationType) {
+			t.Fatalf("legacy append_if_fits = %v; want invalid_mutation_type", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := mustTr(t, db)
+	defer read.Close()
+	value, err := read.Get(ctx, k)
+	if err != nil || string(value) != "value" {
+		t.Fatalf("append_if_fits result = %q, %v", value, err)
 	}
 }
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"math"
 	"math/big"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/can1357/fdbgo/fdb"
+	"github.com/can1357/fdbgo/subspace"
 	"github.com/can1357/fdbgo/tuple"
 )
 
@@ -29,7 +32,26 @@ func run(t *testing.T, sm *StackMachine, insts ...tuple.Tuple) []any {
 // pureMachine is a stack machine for instructions that do not touch the
 // database.
 func pureMachine() *StackMachine {
-	return &StackMachine{prefix: []byte("pure"), de: &directoryExtension{}}
+	return &StackMachine{apiVersion: 740, prefix: []byte("pure"), de: &directoryExtension{}}
+}
+
+func TestDirectoryInvalidOperandPreservesStack(t *testing.T) {
+	for _, op := range []string{"STRIP_PREFIX", "UNPACK_KEY", "CONTAINS", "LOG_SUBSPACE"} {
+		t.Run(op, func(t *testing.T) {
+			sm := pureMachine()
+			sm.de = &directoryExtension{list: []any{subspace.FromBytes([]byte("prefix/"))}}
+			sm.push(0, []byte("sentinel"))
+			sm.push(1, int64(1))
+			sm.de.processOp(sm, op, true, false, 2)
+			result, ok := sm.pop().([]byte)
+			if !ok || !bytes.Equal(result, directoryErrorResult) {
+				t.Fatalf("invalid directory operand = %v; want DIRECTORY_ERROR", result)
+			}
+			if value := sm.pop(); !bytes.Equal(value.([]byte), []byte("sentinel")) {
+				t.Fatalf("unrelated stack entry changed: %v", value)
+			}
+		})
+	}
 }
 
 func TestSubOverflowsToBigInt(t *testing.T) {
@@ -104,6 +126,227 @@ func TestTupleSortAndVersionstamp(t *testing.T) {
 	if len(got) != 4 || !bytes.Equal(got[0].([]byte), errorMultiple) || !bytes.Equal(got[1].([]byte), errorNone) ||
 		!bytes.Equal(got[2].([]byte), okResult) || !bytes.Equal(got[3].([]byte), want) {
 		t.Errorf("TUPLE_PACK_WITH_VERSIONSTAMP = %q", got)
+	}
+}
+
+func TestTupleVersionstampDeclaredAPIVersion(t *testing.T) {
+	vs := tuple.IncompleteVersionstamp(7)
+	prefix := []byte("prefix/")
+	canonical, err := (tuple.Tuple{vs}).PackWithVersionstamp(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, api := range []int{500, 510, 520, 740} {
+		t.Run(fmt.Sprint(api), func(t *testing.T) {
+			sm := pureMachine()
+			sm.apiVersion = api
+			got := run(t, sm,
+				tuple.Tuple{"PUSH", vs},
+				tuple.Tuple{"PUSH", vs},
+				tuple.Tuple{"PUSH", int64(2)},
+				tuple.Tuple{"PUSH", prefix},
+				tuple.Tuple{"TUPLE_PACK_WITH_VERSIONSTAMP"},
+				tuple.Tuple{"PUSH", "complete"},
+				tuple.Tuple{"PUSH", int64(1)},
+				tuple.Tuple{"PUSH", prefix},
+				tuple.Tuple{"TUPLE_PACK_WITH_VERSIONSTAMP"},
+				tuple.Tuple{"PUSH", vs},
+				tuple.Tuple{"PUSH", int64(1)},
+				tuple.Tuple{"PUSH", prefix},
+				tuple.Tuple{"TUPLE_PACK_WITH_VERSIONSTAMP"},
+			)
+			want := canonical
+			if api < 520 {
+				want = want[:len(want)-2]
+			}
+			if len(got) != 4 || !bytes.Equal(got[0].([]byte), errorMultiple) ||
+				!bytes.Equal(got[1].([]byte), errorNone) || !bytes.Equal(got[2].([]byte), okResult) ||
+				!bytes.Equal(got[3].([]byte), want) {
+				t.Fatalf("tuple versionstamp results = %q", got)
+			}
+
+			// Python's uint16 pack rejects overflow rather than truncating it.
+			for _, offset := range []int{math.MaxUint16, math.MaxUint16 + 1} {
+				packed, err := sm.packWithVersionstamp(tuple.Tuple{vs}, bytes.Repeat([]byte("p"), offset-1))
+				if api < 520 && offset > math.MaxUint16 {
+					if err == nil {
+						t.Fatal("old tuple format accepted an overflowing offset")
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var gotOffset uint32
+				if api < 520 {
+					gotOffset = uint32(binary.LittleEndian.Uint16(packed[len(packed)-2:]))
+				} else {
+					gotOffset = binary.LittleEndian.Uint32(packed[len(packed)-4:])
+				}
+				if gotOffset != uint32(offset) {
+					t.Fatalf("offset = %d, want %d", gotOffset, offset)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionstampMutationOperands(t *testing.T) {
+	for _, api := range []int{500, 510, 520, 740} {
+		t.Run(fmt.Sprint(api), func(t *testing.T) {
+			sm := pureMachine()
+			sm.apiVersion = api
+			for _, tc := range []struct {
+				name       string
+				mt         fdb.MutationType
+				key, value []byte
+			}{
+				{"key", fdb.MutationTypeSetVersionstampedKey, []byte("pXXXXXXXXXX\x01\x00"), []byte("v")},
+				{"key-short", fdb.MutationTypeSetVersionstampedKey, []byte{1}, []byte("v")},
+				{"key-empty-body", fdb.MutationTypeSetVersionstampedKey, []byte{0, 0}, []byte("v")},
+				{"key-invalid-offset", fdb.MutationTypeSetVersionstampedKey, []byte("XXXXXXXXXX\xff\xff"), []byte("v")},
+				{"value", fdb.MutationTypeSetVersionstampedValue, []byte("k"), []byte("XXXXXXXXXXtail\xff\xff\xff\xff")},
+				{"value-nonzero-offset", fdb.MutationTypeSetVersionstampedValue, []byte("k"), []byte("headXXXXXXXXXXtail\x04\x00\x00\x00")},
+				{"value-short", fdb.MutationTypeSetVersionstampedValue, []byte("k"), []byte("XXXXXXXXX")},
+				{"value-empty", fdb.MutationTypeSetVersionstampedValue, []byte("k"), nil},
+				{"unrelated", fdb.MutationTypeAdd, []byte("k"), []byte{1}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					originalKey, originalValue := bytes.Clone(tc.key), bytes.Clone(tc.value)
+					key, value := sm.mutationOperands(tc.mt, tc.key, tc.value)
+					wantKey, wantValue := bytes.Clone(tc.key), bytes.Clone(tc.value)
+					if api < 520 {
+						switch tc.mt {
+						case fdb.MutationTypeSetVersionstampedKey:
+							if len(wantKey) >= 2 {
+								wantKey = append(wantKey, 0, 0)
+							}
+						case fdb.MutationTypeSetVersionstampedValue:
+							wantValue = append(wantValue, 0, 0, 0, 0)
+						}
+					}
+					if !bytes.Equal(key, wantKey) || !bytes.Equal(value, wantValue) {
+						t.Fatalf("operands = %x, %x; want %x, %x", key, value, wantKey, wantValue)
+					}
+					if !bytes.Equal(tc.key, originalKey) || !bytes.Equal(tc.value, originalValue) {
+						t.Fatal("operand adaptation mutated a stack value")
+					}
+					if api >= 520 && (len(key) > 0 && &key[0] != &tc.key[0] ||
+						len(value) > 0 && &value[0] != &tc.value[0]) {
+						t.Fatal("current API operands were copied")
+					}
+				})
+			}
+		})
+	}
+}
+
+// Reproduce the API500 generator's VERSIONSTAMP pair: an implicit value offset
+// and a uint16 key offset, followed by GET_READ_VERSION. Previously that read
+// returned client_invalid_operation even though both old operands were valid.
+func TestVersionstampDeclaredAPIInstructions(t *testing.T) {
+	cf := os.Getenv("FDB_CLUSTER_FILE")
+	if cf == "" {
+		t.Skip("FDB_CLUSTER_FILE not set")
+	}
+	var err error
+	if db, err = fdb.Open(cf); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	prefix := []byte("stacktester-versionstamp-formats/")
+	defer func() {
+		if err := db.Transact(ctx, func(tr *fdb.Transaction) error {
+			tr.ClearRange(fdb.KeyRange{Begin: prefix, End: append(bytes.Clone(prefix), 0xff)})
+			return nil
+		}); err != nil {
+			t.Error(err)
+		}
+	}()
+	for _, api := range []int{500, 510, 520, 740} {
+		t.Run(fmt.Sprint(api), func(t *testing.T) {
+			keyPrefix := []byte(fmt.Sprintf("%s%d/", prefix, api))
+			key := append(bytes.Clone(keyPrefix), []byte("XXXXXXXXXXtail")...)
+			value := []byte("XXXXXXXXXXtail\xff\xff\xff\xff")
+			if api < 520 {
+				key = binary.LittleEndian.AppendUint16(key, uint16(len(keyPrefix)))
+			} else {
+				key = binary.LittleEndian.AppendUint32(key, uint32(len(keyPrefix)))
+				// Offset zero is representable even on pre-520 servers.
+				// Nonzero current offsets are covered by the pure operand test.
+				value = binary.LittleEndian.AppendUint32(value, 0)
+			}
+			valueKey := append(bytes.Clone(keyPrefix), []byte("value")...)
+			sm := newStackMachine(keyPrefix, api)
+			got := run(t, sm,
+				tuple.Tuple{"PUSH", value},
+				tuple.Tuple{"PUSH", valueKey},
+				tuple.Tuple{"PUSH", "SET_VERSIONSTAMPED_VALUE"},
+				tuple.Tuple{"ATOMIC_OP"},
+				tuple.Tuple{"PUSH", []byte("key-value")},
+				tuple.Tuple{"PUSH", key},
+				tuple.Tuple{"PUSH", "SET_VERSIONSTAMPED_KEY"},
+				tuple.Tuple{"ATOMIC_OP"},
+				tuple.Tuple{"GET_READ_VERSION"},
+				tuple.Tuple{"COMMIT"},
+				tuple.Tuple{"WAIT_FUTURE"},
+			)
+			if len(got) != 2 || !bytes.Equal(got[0].([]byte), gotReadVersion) ||
+				!bytes.Equal(got[1].([]byte), resultNotPresent) {
+				t.Fatalf("valid versionstamp pair = %q", got)
+			}
+			stamp, err := sm.currentTransaction().Versionstamp()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stampedKey := append(bytes.Clone(keyPrefix), stamp...)
+			stampedKey = append(stampedKey, []byte("tail")...)
+			stampedValue := append(bytes.Clone(stamp), []byte("tail\xff\xff\xff\xff")...)
+			if err := db.ReadTransact(ctx, func(tr fdb.ReadTransaction) error {
+				for _, kv := range []fdb.KeyValue{{Key: stampedKey, Value: []byte("key-value")}, {Key: valueKey, Value: stampedValue}} {
+					got, err := tr.Get(ctx, kv.Key)
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(got, kv.Value) {
+						t.Errorf("key %x = %x, want %x", kv.Key, got, kv.Value)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, op := range []string{"SET_VERSIONSTAMPED_KEY", "SET_VERSIONSTAMPED_VALUE"} {
+				for _, cancelled := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/cancelled=%t", op, cancelled), func(t *testing.T) {
+						sm := newStackMachine(keyPrefix, api)
+						if cancelled {
+							sm.processInst(0, tuple.Tuple{"CANCEL"})
+						}
+						key, value := valueKey, []byte("XXXXXXXXX")
+						if op == "SET_VERSIONSTAMPED_KEY" {
+							key, value = []byte{0}, []byte("v")
+						} else if api >= 520 {
+							value = binary.LittleEndian.AppendUint32(value, 0)
+						}
+						got := run(t, sm,
+							tuple.Tuple{"PUSH", value},
+							tuple.Tuple{"PUSH", key},
+							tuple.Tuple{"PUSH", op},
+							tuple.Tuple{"ATOMIC_OP"},
+							tuple.Tuple{"GET_READ_VERSION"},
+						)
+						// GET_READ_VERSION reports deferred malformed-operand
+						// errors before cancellation, matching the C client.
+						if len(got) != 1 || !bytes.Equal(got[0].([]byte), packErrorCode(2000)) {
+							t.Fatalf("invalid operand result = %q, want error 2000", got)
+						}
+					})
+				}
+			}
+		})
 	}
 }
 
@@ -186,7 +429,7 @@ func TestVersionstampProtocolLifecycle(t *testing.T) {
 		{"replace", []tuple.Tuple{{"NEW_TRANSACTION"}}, fdb.ErrBrokenPromise},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sm := newStackMachine([]byte("stacktester-versionstamp-" + tc.name))
+			sm := newStackMachine([]byte("stacktester-versionstamp-"+tc.name), 740)
 			insts := []tuple.Tuple{{"GET_VERSIONSTAMP"}}
 			insts = append(insts, tc.end...)
 			insts = append(insts, set...)
@@ -208,7 +451,7 @@ func TestVersionstampProtocolLifecycle(t *testing.T) {
 
 	for _, op := range []string{"COMMIT", "ON_ERROR", "GET_READ_VERSION"} {
 		t.Run("expired-"+op, func(t *testing.T) {
-			sm := newStackMachine([]byte("stacktester-versionstamp-expired-" + op))
+			sm := newStackMachine([]byte("stacktester-versionstamp-expired-"+op), 740)
 			sm.processInst(0, tuple.Tuple{"GET_VERSIONSTAMP"})
 			if err := sm.currentTransaction().Options().SetTimeout(1); err != nil {
 				t.Fatal(err)
@@ -230,7 +473,7 @@ func TestVersionstampProtocolLifecycle(t *testing.T) {
 	}
 
 	t.Run("failed-commit", func(t *testing.T) {
-		sm := newStackMachine([]byte("stacktester-versionstamp-conflict"))
+		sm := newStackMachine([]byte("stacktester-versionstamp-conflict"), 740)
 		sm.processInst(0, tuple.Tuple{"GET_VERSIONSTAMP"})
 		tr := sm.currentTransaction()
 		if _, err := tr.Get(ctx, key); err != nil {
@@ -254,7 +497,7 @@ func TestVersionstampProtocolLifecycle(t *testing.T) {
 	})
 
 	t.Run("read-only", func(t *testing.T) {
-		got := run(t, newStackMachine([]byte("stacktester-versionstamp-read-only")),
+		got := run(t, newStackMachine([]byte("stacktester-versionstamp-read-only"), 740),
 			tuple.Tuple{"GET_VERSIONSTAMP"}, tuple.Tuple{"COMMIT"},
 			tuple.Tuple{"WAIT_FUTURE"}, tuple.Tuple{"POP"}, tuple.Tuple{"RESET"},
 		)
@@ -264,7 +507,7 @@ func TestVersionstampProtocolLifecycle(t *testing.T) {
 	})
 
 	t.Run("cancelled-registration", func(t *testing.T) {
-		got := run(t, newStackMachine([]byte("stacktester-versionstamp-cancelled")),
+		got := run(t, newStackMachine([]byte("stacktester-versionstamp-cancelled"), 740),
 			tuple.Tuple{"CANCEL"}, tuple.Tuple{"GET_VERSIONSTAMP"},
 			tuple.Tuple{"WAIT_FUTURE"}, tuple.Tuple{"RESET"},
 		)
@@ -287,7 +530,7 @@ func TestOnErrorRestoresTransaction(t *testing.T) {
 	}
 	defer db.Close()
 
-	got := run(t, newStackMachine([]byte("stacktester-on-error-test")),
+	got := run(t, newStackMachine([]byte("stacktester-on-error-test"), 740),
 		tuple.Tuple{"NEW_TRANSACTION"},
 		tuple.Tuple{"PUSH", int64(1020)},
 		tuple.Tuple{"ON_ERROR"},

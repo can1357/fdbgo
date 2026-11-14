@@ -3,9 +3,13 @@
 // client-side failure monitor for storage reads, process-wide network
 // options, and TLS.
 //
-// After a 44-byte ConnectPacket each way, every packet is
+// After a versioned ConnectPacket each way, every packet is
 //
-//	[u32 len][u64 XXH3-64 of the next len bytes, plaintext only][16-byte destination token][message]
+//	[u32 len][optional checksum][16-byte destination token][message]
+//
+// Checksums are CRC32C through 6.3 and XXH3-64 from 7.0. TLS omits the
+// checksum except in 5.0. The negotiated connection selects binary (5.x–6.2)
+// or object (6.2 onward) serialization independently of other connections.
 //
 // Replies return on the connection that carried the request, addressed to the
 // token minted for its ReplyPromise, so one connection per server process
@@ -20,6 +24,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
+	"io"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -27,6 +33,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -175,7 +182,10 @@ type Connection struct {
 	tokenHi  uint64
 	nextID   atomic.Uint64
 	checksum bool
-	pending  [pendingShards]shard
+	// object and checksumBytes are immutable after negotiation.
+	object        bool
+	checksumBytes int
+	pending       [pendingShards]shard
 
 	// dead is set before the pending map is drained on failure.
 	dead atomic.Bool
@@ -206,7 +216,9 @@ var builders = sync.Pool{New: func() any { return new(wire.Builder) }}
 // Connect dials addr (over TLS for :tls addresses), negotiates a supported
 // protocol and starts the connection's goroutines. It initially advertises
 // 7.4; a supported mismatch closes that socket and redials with the peer's
-// protocol before any requests can be sent. All attempts share a 5s timeout.
+// protocol before any requests can be sent. A peer closing before its hello
+// gets one fresh 5.0 probe: that release does not reply on a mismatch.
+// All attempts share a 5s timeout.
 // Failures are NotDelivered (no connection, TLS failure, timeout), Incompatible
 // or Malformed (bad handshake); if ctx ends first its error is returned.
 func Connect(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
@@ -231,7 +243,8 @@ func Connect(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 
 func dial(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 	var d net.Dialer
-	advertised := wire.Protocol74
+	advertised := wire.ProtocolVersion(uint64(wire.Protocol74) | objectSerializerFlag)
+	tried := map[wire.ProtocolVersion]bool{advertised: true}
 	for {
 		raw, err := d.DialContext(ctx, "tcp", addr.Addr.String())
 		if err != nil {
@@ -262,44 +275,67 @@ func dial(ctx context.Context, addr wire.NetAddr) (*Connection, error) {
 		}
 		if err != nil {
 			raw.Close()
-			if err == Incompatible && peer.Supported() && !peer.Compatible(advertised) {
-				// FlowTransport marks compatibility from the original ConnectPacket.
-				// Merely accepting a supported peer here would leave it rejecting
-				// our requests. Only a new socket can advertise the matching version.
-				advertised = peer.Normalized()
+			if err == errNoHello {
+				// 5.0 rejects mismatched versions before sending its ConnectPacket
+				// (FlowTransport.actor.cpp:connectionReader/connectionIncoming).
+				// Probe it once on a fresh socket, never with application bytes.
+				next := wire.Protocol50
+				if !tried[next] && ctx.Err() == nil {
+					tried[next] = true
+					advertised = next
+					continue
+				}
+				return nil, NotDelivered
+			}
+			next := peer
+			if err == Incompatible && validCodec(peer) && !tried[next] {
+				// Ordinary RPC receivers require the exact protocol, including
+				// patch bits, even when the handshake considers them compatible.
+				// The initial ConnectPacket also fixes 6.2's serializer choice.
+				// Never send RPCs on this socket.
+				tried[next] = true
+				advertised = next
 				continue
 			}
 			return nil, err
 		}
 		_ = raw.SetDeadline(time.Time{})
-		// TLS authenticates packets itself, so FlowTransport sends no checksum.
-		return start(addr, raw, rw, !addr.TLS, peer), nil
+		checksum := !addr.TLS || peer.Normalized() < wire.ProtocolVersion(0x0FDB00A551040000)
+		return start(addr, raw, rw, checksum, peer), nil
 	}
 }
 
 // handshake returns the peer's protocol after exchanging ConnectPackets.
-// A supported mismatch returns the peer version with Incompatible so dial can
-// retry on a new socket; other failures return a zero version and cannot retry.
+// A supported mismatch returns the peer version, including its codec flag,
+// with Incompatible so dial can retry on a new socket. An empty-header close
+// returns errNoHello for the bounded 5.0 probe; no application bytes are sent.
 func handshake(rw net.Conn, advertised wire.ProtocolVersion) (wire.ProtocolVersion, error) {
 	var pkt [4 + connectPacketLen]byte
-	binary.LittleEndian.PutUint32(pkt[0:], connectPacketLen)
-	binary.LittleEndian.PutUint64(pkt[4:], uint64(advertised)|objectSerializerFlag)
+	size := connectPacketSize(advertised)
+	binary.LittleEndian.PutUint32(pkt[0:], uint32(size))
+	binary.LittleEndian.PutUint64(pkt[4:], uint64(advertised))
 	// canonicalRemotePort, connectionId, ip4, flags and ip6 stay zero: we are a client.
-	if _, err := rw.Write(pkt[:]); err != nil {
+	if n, err := rw.Write(pkt[:4+size]); err != nil || n != 4+size {
 		return 0, NotDelivered
 	}
 	var hdr [12]byte
-	if _, err := readFull(rw, hdr[:]); err != nil {
+	if n, err := readFull(rw, hdr[:]); err != nil {
+		if n == 0 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)) {
+			return 0, errNoHello
+		}
 		return 0, NotDelivered
 	}
 	n := binary.LittleEndian.Uint32(hdr[0:])
 	version := binary.LittleEndian.Uint64(hdr[4:])
-	if n < 8 || n > 1024 {
+	if n < 22 || n > 1024 {
 		return 0, Malformed
 	}
-	peer := wire.ProtocolVersion(version & versionMask)
-	if version&objectSerializerFlag == 0 || !peer.Supported() {
+	peer := wire.ProtocolVersion(version)
+	if !validCodec(peer) {
 		return 0, Incompatible
+	}
+	if int(n) < connectPacketSize(peer) {
+		return 0, Malformed
 	}
 	for remaining := int(n) - 8; remaining > 0; {
 		count := min(remaining, len(pkt))
@@ -308,11 +344,37 @@ func handshake(rw net.Conn, advertised wire.ProtocolVersion) (wire.ProtocolVersi
 		}
 		remaining -= count
 	}
-	if !peer.Compatible(advertised) {
+	if peer != advertised {
 		return peer, Incompatible
 	}
 	return peer, nil
 }
+
+// ConnectPacket gained IPv6 fields in 6.1 (FlowTransport::ConnectPacket).
+func connectPacketSize(protocol wire.ProtocolVersion) int {
+	if protocol.HasIPv6() {
+		return connectPacketLen
+	}
+	return 22
+}
+
+// 6.2 introduced a serializer knob; 6.3 removed binary transport entirely.
+func validCodec(protocol wire.ProtocolVersion) bool {
+	if uint64(protocol)&^(versionMask|objectSerializerFlag) != 0 || !protocol.Supported() {
+		return false
+	}
+	object := uint64(protocol)&objectSerializerFlag != 0
+	v := protocol.Normalized()
+	if v < wire.ProtocolVersion(0x0FDB00B062010000) {
+		return !object
+	}
+	return v == wire.ProtocolVersion(0x0FDB00B062010000) || object
+}
+
+var (
+	crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+	errNoHello  = errors.New("transport: peer closed before ConnectPacket")
+)
 
 func readFull(r net.Conn, b []byte) (int, error) {
 	n := 0
@@ -321,6 +383,9 @@ func readFull(r net.Conn, b []byte) (int, error) {
 		n += m
 		if err != nil {
 			return n, err
+		}
+		if m == 0 {
+			return n, io.ErrNoProgress
 		}
 	}
 	return n, nil
@@ -331,7 +396,7 @@ func readFull(r net.Conn, b []byte) (int, error) {
 func start(addr wire.NetAddr, raw, rw net.Conn, checksum bool, protocol wire.ProtocolVersion) *Connection {
 	c := &Connection{
 		addr:     addr,
-		protocol: protocol,
+		protocol: wire.ProtocolVersion(uint64(protocol) & versionMask),
 		raw:      raw,
 		rw:       rw,
 		tokenHi:  rand.Uint64() &^ 1,
@@ -340,6 +405,17 @@ func start(addr wire.NetAddr, raw, rw net.Conn, checksum bool, protocol wire.Pro
 		done:     make(chan struct{}),
 		wake:     make(chan struct{}, 1),
 		created:  time.Now(),
+	}
+	c.object = uint64(protocol)&objectSerializerFlag != 0 || protocol.UsesObjectSerializer()
+	// A negotiated 6.2 peer may explicitly use binary instead of its default.
+	if protocol.Normalized() == wire.ProtocolVersion(0x0FDB00B062010000) {
+		c.object = uint64(protocol)&objectSerializerFlag != 0
+	}
+	if checksum {
+		c.checksumBytes = 8
+		if protocol.Normalized() < wire.ProtocolVersion(0x0FDB00B070010000) {
+			c.checksumBytes = 4
+		}
 	}
 	c.nextID.Store(1)
 	for i := range c.pending {
@@ -359,6 +435,10 @@ func (c *Connection) Addr() wire.NetAddr { return c.addr }
 // Patch bits are preserved. The value never changes: reconnecting after a server
 // upgrade creates a new Connection rather than reusing or replaying this one's RPCs.
 func (c *Connection) ProtocolVersion() wire.ProtocolVersion { return c.protocol }
+
+// UsesObjectSerializer reports the codec selected by the peer's ConnectPacket.
+// Unlike ProtocolVersion.UsesObjectSerializer, it accounts for 6.2's knob.
+func (c *Connection) UsesObjectSerializer() bool { return c.object }
 
 // Stats returns the bytes received and sent so far and the time since the
 // connection was established.
@@ -423,27 +503,55 @@ func (c *Connection) remove(id uint64) bool {
 }
 
 // request encodes req with reply token id and queues it for dest.
-func (c *Connection) request(dest wire.UID, req wire.Message, id uint64) {
-	c.queueRequest(dest, req, id)
+func (c *Connection) request(dest wire.UID, req wire.Message, id uint64) error {
+	if err := c.queueRequest(dest, req, id); err != nil {
+		return err
+	}
 	c.wakeWriter()
+	return nil
 }
 
 // queueRequest encodes and enqueues a request without waking the writer.
-func (c *Connection) queueRequest(dest wire.UID, req wire.Message, id uint64) {
+func (c *Connection) queueRequest(dest wire.UID, req wire.Message, id uint64) error {
 	if dest != wire.WellKnown(wire.TokenPing) {
 		c.lastSendNanos.Store(int64(time.Since(c.created)))
 	}
 	b := builders.Get().(*wire.Builder)
 	b.Reset()
-	off := req.Encode(b, wire.UID{First: c.tokenHi, Second: id})
-	b.FinishRequest(off, req.FileID())
+	b.Protocol = c.protocol
+	reply := wire.UID{First: c.tokenHi, Second: id}
+	if c.object {
+		off := req.Encode(b, reply)
+		b.FinishRequest(off, wire.MessageFileID(req, c.protocol))
+	} else if err := wire.EncodeLegacy(b, req, reply, c.protocol); err != nil {
+		builders.Put(b)
+		return err
+	}
 	c.enqueue(b, dest)
 	builders.Put(b)
+	return nil
+}
+
+// destination resolves the client's current well-known tokens for this peer.
+// 7.2 inserted UnauthorizedEndpoint before the coordinator endpoints, shifting
+// GetLeader and OpenDatabase from 2/3 to 3/4. ProtocolInfo remains 10.
+// Resolve only outgoing requests, once before registration and queueing: reply
+// tokens and tokens named by failure notices are already peer-native.
+func (c *Connection) destination(dest wire.UID) wire.UID {
+	if c.protocol.Normalized() < wire.Protocol72 {
+		switch dest {
+		case wire.WellKnown(wire.TokenOpenDatabase - 1), wire.WellKnown(wire.TokenOpenDatabase):
+			dest.Second--
+		}
+	}
+	return dest
 }
 
 // Send queues a best-effort one-way notification without allocating a reply slot.
 func (c *Connection) Send(dest wire.UID, msg wire.Message) {
-	c.request(dest, msg, 0)
+	if wire.ValidateRequest(msg, c.protocol) == nil {
+		_ = c.request(c.destination(dest), msg, 0)
+	}
 }
 
 // enqueue frames the finished message in b for dest and queues it for the writer.
@@ -452,11 +560,16 @@ func (c *Connection) enqueue(b *wire.Builder, dest wire.UID) {
 	binary.LittleEndian.PutUint64(tok[0:], dest.First)
 	binary.LittleEndian.PutUint64(tok[8:], dest.Second)
 	n := len(b.Finished())
-	if c.checksum {
+	if c.checksumBytes == 8 {
 		sum := xxh3.Hash(b.Finished())
 		hdr := b.Raw(12)
 		binary.LittleEndian.PutUint32(hdr[0:], uint32(n))
 		binary.LittleEndian.PutUint64(hdr[4:], sum)
+	} else if c.checksumBytes == 4 {
+		sum := crc32.Checksum(b.Finished(), crc32cTable)
+		hdr := b.Raw(8)
+		binary.LittleEndian.PutUint32(hdr[0:], uint32(n))
+		binary.LittleEndian.PutUint32(hdr[4:], sum)
 	} else {
 		binary.LittleEndian.PutUint32(b.Raw(4), uint32(n))
 	}
@@ -489,12 +602,23 @@ func (w waiter) reply(msg []byte, err RPCError) { w <- result{msg, err} }
 // are RPCError kinds, fdberr.Error for remote errors, or ctx's error when ctx
 // ends first (the request's slot is released; a late reply is dropped).
 func Call[R any](ctx context.Context, c *Connection, dest wire.UID, req wire.Request[R]) (R, error) {
+	if err := wire.ValidateRequest(req, c.protocol); err != nil {
+		var zero R
+		return zero, err
+	}
+	dest = c.destination(dest)
 	slot, err := registerCall(c, dest)
 	if err != nil {
 		var zero R
 		return zero, err
 	}
-	c.request(dest, req, slot.id)
+	if err := c.request(dest, req, slot.id); err != nil {
+		if !c.remove(slot.id) {
+			<-slot.w
+		}
+		var zero R
+		return zero, err
+	}
 	return collectCall(ctx, c, req, slot)
 }
 
@@ -529,15 +653,15 @@ func collectCall[R any](ctx context.Context, c *Connection, req wire.Request[R],
 		// The reader already took the slot; its send is imminent.
 		res = <-slot.w
 	}
-	return decodeResult(req, res)
+	return decodeResult(c, req, res)
 }
 
-func decodeResult[R any](req wire.Request[R], res result) (R, error) {
+func decodeResult[R any](c *Connection, req wire.Request[R], res result) (R, error) {
 	if res.err != 0 {
 		var zero R
 		return zero, res.err
 	}
-	return decode(req, res.msg)
+	return decode(c, req, res.msg)
 }
 
 // BatchCall is one request in a blocking batch, possibly sharing a connection
@@ -598,7 +722,13 @@ func CallBatch[R any](ctx context.Context, calls []BatchCall[R]) []BatchReply[R]
 	for i, call := range calls {
 		slot := &slots[i]
 		slot.completion = completion
-		id, ok, removed := call.Connection.register(call.Destination, slot)
+		if err := wire.ValidateRequest(call.Request, call.Connection.protocol); err != nil {
+			slot.err = err
+			slot.complete()
+			continue
+		}
+		dest := call.Connection.destination(call.Destination)
+		id, ok, removed := call.Connection.register(dest, slot)
 		slot.id = id
 		if !ok {
 			slot.failed = true
@@ -607,7 +737,13 @@ func CallBatch[R any](ctx context.Context, calls []BatchCall[R]) []BatchReply[R]
 			}
 			continue
 		}
-		call.Connection.queueRequest(call.Destination, call.Request, id)
+		if err := call.Connection.queueRequest(dest, call.Request, id); err != nil {
+			slot.err = err
+			if call.Connection.remove(id) {
+				slot.complete()
+			}
+			continue
+		}
 		if first == nil {
 			first = call.Connection
 		} else if call.Connection != first {
@@ -628,7 +764,7 @@ func CallBatch[R any](ctx context.Context, calls []BatchCall[R]) []BatchReply[R]
 	case <-ctx.Done():
 		for i := range slots {
 			slot := &slots[i]
-			if calls[i].Connection.remove(slot.id) {
+			if slot.id != 0 && calls[i].Connection.remove(slot.id) {
 				slot.err = ctx.Err()
 				slot.complete()
 			}
@@ -645,15 +781,21 @@ func CallBatch[R any](ctx context.Context, calls []BatchCall[R]) []BatchReply[R]
 		case slot.err != nil:
 			replies[i].Err = slot.err
 		default:
-			replies[i].Value, replies[i].Err = decodeResult(calls[i].Request, slot.res)
+			replies[i].Value, replies[i].Err = decodeResult(calls[i].Connection, calls[i].Request, slot.res)
 		}
 	}
 	return replies
 }
 
 // decode unwraps a reply message, mapping parse failures to Malformed.
-func decode[R any](req wire.Request[R], msg []byte) (R, error) {
-	r, err := wire.DecodeReply(req, msg)
+func decode[R any](c *Connection, req wire.Request[R], msg []byte) (R, error) {
+	var r R
+	var err error
+	if c.object {
+		r, err = wire.DecodeReply(req, msg, c.protocol)
+	} else {
+		r, err = wire.DecodeLegacy(req, msg, c.protocol)
+	}
 	if err != nil {
 		var code fdberr.Error
 		if errors.As(err, &code) {
@@ -730,7 +872,7 @@ func (c *Connection) writeLoop() {
 		if len(buf) > 0 {
 			start := time.Now()
 			NoteTime(start)
-			if _, err := c.rw.Write(buf); err != nil {
+			if n, err := c.rw.Write(buf); err != nil || n != len(buf) {
 				c.fail()
 				return
 			}
@@ -752,10 +894,7 @@ func (c *Connection) readLoop() {
 	defer c.workerDone()
 	defer c.drain()
 	defer c.fail()
-	hdrLen := 4
-	if c.checksum {
-		hdrLen = 12
-	}
+	hdrLen := 4 + c.checksumBytes
 	buf := make([]byte, readChunk)
 	r, w := 0, 0
 	// shared is set once a reply aliasing buf was delivered.
@@ -772,7 +911,10 @@ func (c *Connection) readLoop() {
 				break
 			}
 			pkt := buf[r+hdrLen : r+hdrLen+n : r+hdrLen+n]
-			if c.checksum && xxh3.Hash(pkt) != binary.LittleEndian.Uint64(buf[r+4:]) {
+			if c.checksumBytes == 8 && xxh3.Hash(pkt) != binary.LittleEndian.Uint64(buf[r+4:]) {
+				return
+			}
+			if c.checksumBytes == 4 && crc32.Checksum(pkt, crc32cTable) != binary.LittleEndian.Uint32(buf[r+4:]) {
 				return
 			}
 			r += hdrLen + n
@@ -834,24 +976,46 @@ func (c *Connection) deliver(pkt []byte) bool {
 	switch tok {
 	case wire.WellKnown(wire.TokenPing):
 		// Servers ping clients that go quiet; answer like the PingReceiver does.
-		if reply, err := wire.PingReplyToken(msg); err == nil {
+		var reply wire.UID
+		var err error
+		if c.object {
+			reply, err = wire.PingReplyToken(msg, c.protocol)
+		} else {
+			reply, err = wire.PingReplyTokenLegacy(msg, c.protocol)
+		}
+		if err == nil {
 			b := builders.Get().(*wire.Builder)
 			b.Reset()
-			wire.EncodeVoidReply(b)
+			b.Protocol = c.protocol
+			if c.object {
+				wire.EncodeVoidReply(b)
+			} else {
+				wire.EncodeVoidReplyLegacy(b, c.protocol)
+			}
 			c.enqueue(b, reply)
 			c.wakeWriter()
 			builders.Put(b)
 		}
 	case wire.WellKnown(wire.TokenEndpointNotFound):
-		if gone, err := wire.NoticeToken(msg); err == nil {
+		if gone, err := c.noticeToken(msg); err == nil {
 			c.failDest(gone, EndpointNotFound)
 		}
 	case wire.WellKnown(wire.TokenUnauthorizedEndpoint):
-		if denied, err := wire.NoticeToken(msg); err == nil {
+		if c.protocol.Normalized() < wire.Protocol72 {
+			break
+		}
+		if denied, err := c.noticeToken(msg); err == nil {
 			c.failDest(denied, Unauthorized)
 		}
 	}
 	return false
+}
+
+func (c *Connection) noticeToken(msg []byte) (wire.UID, error) {
+	if c.object {
+		return wire.NoticeToken(msg, c.protocol)
+	}
+	return wire.NoticeTokenLegacy(msg, c.protocol)
 }
 
 // failDest fails every request sent to dest.
@@ -901,7 +1065,11 @@ func (c *Connection) monitor() {
 			}
 			return
 		}
-		c.request(ping, wire.Ping{}, id)
+		if err := c.request(ping, wire.Ping{}, id); err != nil {
+			c.fail()
+			<-w
+			return
+		}
 		seen := c.bytesReceived.Load()
 	wait:
 		for {

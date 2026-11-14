@@ -48,7 +48,7 @@ func TestPointReadConflicts(t *testing.T) {
 	must(t, capture(r.Get(db, []byte("w"), false)))
 	eqPairs(t, readConflicts(r), pair{"a", "a\x00"})
 
-	r.AtomicOp([]byte("n"), []byte{1}, MutationAddValue, 0, false)
+	r.AtomicOp([]byte("n"), []byte{1}, MutationAddValue, AtomicOptions{})
 	must(t, capture(r.Get(db, []byte("n"), false)))
 	eqPairs(t, readConflicts(r), pair{"a", "a\x00"}, pair{"n", "n\x00"})
 }
@@ -175,9 +175,9 @@ func TestExplicitConflictRangesAndCommitPlan(t *testing.T) {
 	r.Set([]byte("a"), []byte("1"))
 	r.ClearRange([]byte("b"), []byte("d"))
 	r.Set([]byte("c"), []byte("3"))
-	r.AtomicOp([]byte("e"), []byte{1, 0}, MutationAddValue, 0, false)
-	r.AtomicOp([]byte("e"), []byte{2, 0}, MutationAddValue, 0, false)
-	r.AtomicOp([]byte("f"), []byte{7}, MutationMin, 0, false)
+	r.AtomicOp([]byte("e"), []byte{1, 0}, MutationAddValue, AtomicOptions{})
+	r.AtomicOp([]byte("e"), []byte{2, 0}, MutationAddValue, AtomicOptions{})
+	r.AtomicOp([]byte("f"), []byte{7}, MutationMinV2, AtomicOptions{})
 	if err := r.AddConflictRange([]byte("x"), []byte("y"), true); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestVersionstampRangesAreUnreadable(t *testing.T) {
 	r := newRyw()
 	template := versionstampTemplate("vs_", 3)
 	r.Set([]byte("vs_0"), []byte("early"))
-	r.AtomicOp(template, []byte("val"), MutationSetVersionstampedKey, 41, true)
+	r.AtomicOp(template, []byte("val"), MutationSetVersionstampedKey, AtomicOptions{ReadVersion: 41, HasReadVersion: true})
 	eqErr(t, r.DeferredError(), nil)
 
 	_, err := await_(t, capture(r.GetRange(db, fgoe("vs_"), fgoe("vs_\xff"), kv.DefaultLimits(), false, false)))
@@ -244,7 +244,7 @@ func TestVersionstampRangesAreUnreadable(t *testing.T) {
 	eqVal(t, must(t, capture(r.Get(db, []byte("k"), false))), "v", true)
 
 	value := binary.LittleEndian.AppendUint32([]byte("0123456789ab"), 1)
-	r.AtomicOp([]byte("sv"), value, MutationSetVersionstampedValue, 0, false)
+	r.AtomicOp([]byte("sv"), value, MutationSetVersionstampedValue, AtomicOptions{})
 	_, err = await_(t, capture(r.Get(db, []byte("sv"), false)))
 	eqErr(t, err, fdberr.AccessedUnreadable)
 	r.SetOption(options.TransactionBypassUnreadable)
@@ -255,7 +255,7 @@ func TestVersionstampRangesAreUnreadable(t *testing.T) {
 
 	r = newRyw()
 	r.Set([]byte("vs_0"), []byte("early"))
-	r.AtomicOp(template, []byte("val"), MutationSetVersionstampedKey, 41, true)
+	r.AtomicOp(template, []byte("val"), MutationSetVersionstampedKey, AtomicOptions{ReadVersion: 41, HasReadVersion: true})
 	plan := must(t, capture(r.Commit()))
 	placed := binary.BigEndian.AppendUint64([]byte("vs_"), 42)
 	placed = binary.LittleEndian.AppendUint32(append(placed, 0, 0), 3)
@@ -265,13 +265,13 @@ func TestVersionstampRangesAreUnreadable(t *testing.T) {
 	eqPairs(t, rangesOf(plan.WriteConflicts), pair{"vs_0", "vs_0\x00"})
 
 	bad := newRyw()
-	bad.AtomicOp([]byte("short"), []byte("v"), MutationSetVersionstampedKey, 0, false)
+	bad.AtomicOp([]byte("short"), []byte("v"), MutationSetVersionstampedKey, AtomicOptions{})
 	eqErr(t, bad.DeferredError(), fdberr.ClientInvalidOperation)
 	bad = newRyw()
-	bad.AtomicOp(kv.MetadataVersionKey, []byte("x"), MutationSetVersionstampedValue, 0, false)
+	bad.AtomicOp(kv.MetadataVersionKey, []byte("x"), MutationSetVersionstampedValue, AtomicOptions{})
 	eqErr(t, bad.DeferredError(), fdberr.ClientInvalidOperation)
 	ok := newRyw()
-	ok.AtomicOp(kv.MetadataVersionKey, MetadataVersionRequiredValue, MutationSetVersionstampedValue, 0, false)
+	ok.AtomicOp(kv.MetadataVersionKey, MetadataVersionRequiredValue, MutationSetVersionstampedValue, AtomicOptions{})
 	eqErr(t, ok.DeferredError(), nil)
 }
 
@@ -405,7 +405,7 @@ func TestFailedReadFailsCommit(t *testing.T) {
 	db := newFakeDB(nil, false)
 	r := newRyw()
 	value := binary.LittleEndian.AppendUint32([]byte("0123456789ab"), 1)
-	r.AtomicOp([]byte("sv"), value, MutationSetVersionstampedValue, 0, false)
+	r.AtomicOp([]byte("sv"), value, MutationSetVersionstampedValue, AtomicOptions{})
 	_, err := await_(t, capture(r.Get(db, []byte("sv"), false)))
 	eqErr(t, err, fdberr.AccessedUnreadable)
 	_, err = await_(t, capture(r.Commit()))
@@ -418,9 +418,9 @@ func TestCompareAndClearDeletes(t *testing.T) {
 	db := newFakeDB([][2]string{{"d", "x"}}, false)
 	r := newRyw()
 	r.Set([]byte("k"), []byte("x"))
-	r.AtomicOp([]byte("k"), []byte("x"), MutationCompareAndClear, 0, false)
+	r.AtomicOp([]byte("k"), []byte("x"), MutationCompareAndClear, AtomicOptions{})
 	eqVal(t, must(t, capture(r.Get(db, []byte("k"), false))), "", false)
-	r.AtomicOp([]byte("d"), []byte("x"), MutationCompareAndClear, 0, false)
+	r.AtomicOp([]byte("d"), []byte("x"), MutationCompareAndClear, AtomicOptions{})
 	eqVal(t, must(t, capture(r.Get(db, []byte("d"), false))), "", false)
 	res := must(t, capture(r.GetRange(db, fgoe(""), fgoe("z"), kv.DefaultLimits(), false, false)))
 	eqKeys(t, res.Data)
@@ -446,7 +446,7 @@ func TestWatchesFireOnOwnWrites(t *testing.T) {
 	eqPairs(t, readConflicts(r), pair{"w", "w\x00"})
 
 	early := capture(r.Watch(db, []byte("v")))
-	r.AtomicOp([]byte("v"), []byte{1}, MutationAddValue, 0, false)
+	r.AtomicOp([]byte("v"), []byte{1}, MutationAddValue, AtomicOptions{})
 	must(t, early)
 
 	held, _ := db.gated(t)
@@ -492,7 +492,7 @@ func TestCommitPlanOwnsMutationBytes(t *testing.T) {
 			r.Set(key, value)
 			key[0], value[0] = 'z', 'X'
 			key, operand := []byte("n"), []byte{1}
-			r.AtomicOp(key, operand, MutationAddValue, 0, false)
+			r.AtomicOp(key, operand, MutationAddValue, AtomicOptions{})
 			key[0], operand[0] = 'z', 99
 			begin, end := []byte("x"), []byte("y")
 			if err := r.AddConflictRange(begin, end, true); err != nil {
@@ -501,7 +501,7 @@ func TestCommitPlanOwnsMutationBytes(t *testing.T) {
 			begin[0], end[0] = 'b', 'c'
 			plan := must(t, capture(r.Commit()))
 			r.Set([]byte("a"), []byte("later"))
-			r.AtomicOp([]byte("n"), []byte{2}, MutationAddValue, 0, false)
+			r.AtomicOp([]byte("n"), []byte{2}, MutationAddValue, AtomicOptions{})
 			r.Reset()
 			r.Set([]byte("a"), []byte("reset"))
 			eqMutations(t, plan.Mutations,
@@ -538,7 +538,7 @@ func TestReadYourWritesDisabledGoesNative(t *testing.T) {
 	r.Clear([]byte("c"))
 	r.SetOption(options.TransactionNextWriteNoWriteConflictRange)
 	r.ClearRange([]byte("d"), []byte("f"))
-	r.AtomicOp([]byte("e"), []byte{1}, MutationAnd, 0, false)
+	r.AtomicOp([]byte("e"), []byte{1}, MutationAndV2, AtomicOptions{})
 	if err := r.AddConflictRange([]byte("r"), []byte("s"), false); err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +670,7 @@ func expectedRange(model map[string][]byte, begin, end kv.KeySelector, limits kv
 }
 
 var modelOps = []uint8{MutationAddValue, MutationAnd, MutationOr, MutationXor, MutationMax, MutationMin,
-	MutationByteMin, MutationByteMax, MutationAppendIfFits, MutationAndV2}
+	MutationByteMin, MutationByteMax, MutationAppendIfFits, MutationAndV2, MutationMinV2}
 
 func rowsEqual(a, b []kv.KeyValue) bool {
 	if len(a) != len(b) {
@@ -723,8 +723,8 @@ func runModel(t *testing.T, seed uint64, async bool) {
 			k := keyForIndex(rnd.below(100))
 			op := modelOps[rnd.below(uint64(len(modelOps)))]
 			param := randomValue(&rnd)
-			r.AtomicOp(k, param, op, 0, false)
-			if v := applyAtomic(normalizeAtomicOp(op), model[string(k)], param); v != nil {
+			r.AtomicOp(k, param, op, AtomicOptions{})
+			if v := applyAtomic(op, model[string(k)], param); v != nil {
 				model[string(k)] = v
 			} else {
 				delete(model, string(k))

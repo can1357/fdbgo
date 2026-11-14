@@ -2,16 +2,16 @@
 
 [![CI](https://github.com/can1357/fdbgo/actions/workflows/ci.yml/badge.svg)](https://github.com/can1357/fdbgo/actions/workflows/ci.yml)
 
-A pure-Go client for FoundationDB 7.3 and 7.4. Connects directly to the cluster—no cgo, `libfdb_c`, or network-thread setup required.
+A pure-Go client for FoundationDB 5.0–8.0. Connects directly to the cluster—no cgo, `libfdb_c`, or network-thread setup required.
 
 Includes transactions, read-your-writes, snapshot reads, range scans, atomic mutations, watches, TLS, and the tuple, subspace, and directory layers.
 
 ## Install
 
-Requires **Go 1.27+** and a **FoundationDB 7.3 or 7.4** cluster. Protocol selection is automatic and independent for each connection; one process can use both releases. The Go API retains its API-740 semantics without a version-selection call.
+Requires **Go 1.27+** and a cluster using one of the [supported protocols](#compatibility). Protocol selection is automatic and independent for each connection; one process can use different server releases. No version-selection call is needed. Once connected, version-dependent behavior follows that release's C client; operations unavailable on older servers return `UnsupportedOperation`.
 
 ```sh
-go get github.com/can1357/fdbgo@v0.1.1
+go get github.com/can1357/fdbgo
 ```
 
 ## Quick start
@@ -91,13 +91,32 @@ fdbgo had higher throughput in all five paired runs at each point. These results
 
 The [`bench`](bench) module and [`scripts/bench.sh`](scripts/bench.sh) provide the comparison harness.
 
-## Limitations
+## Compatibility
 
-Wire protocols for FoundationDB 7.3 and 7.4 are supported; unknown protocols are rejected. Connections renegotiate after a server restart or upgrade, and database handles remain usable across a 7.3 → 7.4 upgrade. Transaction retry and commit-uncertainty rules still apply: use `Transact` and keep callbacks safe to repeat.
+The release matrix covers **5.0.8, 5.1.7, 5.2.8, 6.0.18, 6.1.13, 6.2.30, 6.3.25, 7.0.0, 7.1.67, 7.2.9, 7.3.81, 7.4.8, and 8.0.0**. Other patch releases must advertise a matching wire protocol; unknown protocol revisions are rejected.
 
-Unlike the official multi-version client, fdbgo does not load version-specific C libraries. Both supported protocols use the same client-facing RPC layouts. A future incompatible protocol requires a client update.
+Each connection selects the matching binary or object codec and packet framing. Releases before 6.2 discover proxies through the cluster controller; 5.0 resolves shards through metadata servers. No C libraries are loaded. The 6.2 binary-serializer configuration is supported alongside its default object serializer.
 
-Unsupported features include tenants, configuration-database transactions, special-key writes and management modules, blob granules, client trace files, and knobs.
+Historical behavior can change during an upgrade. For example, `ApproximateSize` ignores deferred transaction errors before 7.2 and reports them on newer servers; it never clears the error for a later commit. Before protocol discovery, local validation uses current-client behavior.
+
+Server capabilities still matter:
+
+| Feature | Minimum server release |
+|---|---|
+| Conflicting-key reporting | 6.3 |
+| Range split points | 7.0 |
+| Mapped range reads | 7.1 |
+| Idempotent commits, cluster ID | 7.2 |
+| Full read-options encoding | 7.2 |
+| Automatic idempotency expiration | 7.3 |
+
+Versionstamp operands keep the Go API's 32-bit offset trailer. The wire codec translates for 5.0/5.1, where key offsets must fit 16 bits and values must put the stamp at offset zero; historical maximum operand sizes remain usable. MIN and AND follow the connected release's semantics. Unavailable atomic mutations and unrepresentable options fail explicitly rather than silently changing semantics.
+
+Connections renegotiate after server restarts and supported upgrades. Transaction retry and commit-uncertainty rules still apply: use `Transact` and keep callbacks safe to repeat. Follow FoundationDB's server upgrade path; client compatibility does not make skipped-version storage upgrades safe.
+
+The [release manifest](scripts/fdb-releases.tsv) pins binaries and source archives. The original 5.0.8 binary-build source is unavailable upstream; its codec audit uses the published release-tag source, and the manifest records that provenance limitation.
+
+Unsupported features include tenants, configuration-database transactions, special-key writes and management modules, blob granules, client trace files, and knobs. 8.0 is an upstream prerelease.
 
 ## Development
 
@@ -110,7 +129,9 @@ go generate ./fdb
 FDB_CLUSTER_FILE=/path/to/fdb.cluster go test -race ./...
 ```
 
-Integration tests skip when `FDB_CLUSTER_FILE` is unset. CI runs race-enabled tests and vet on Linux and macOS, plus live-cluster tests and reference-binding comparisons against **7.3.81 and 7.4.8** on Linux. An isolated persisted-data upgrade test covers concurrent transactions, watches, and snapshot conflicts while the same database handle reconnects from 7.3 to 7.4.
+Integration tests skip when `FDB_CLUSTER_FILE` is unset. CI runs race-enabled tests and vet on Linux and macOS, plus live-cluster tests, matching C-wrapper builds, reference-binding comparisons, and adjacent-release upgrades across the Linux release matrix. Tests for unavailable features verify `UnsupportedOperation`; core transaction tests remain enabled.
+
+Run the complete matrix, or selected releases, with `scripts/test-versions.sh [versions...]`. It needs Linux amd64, Go, a C compiler, `make`, `pkg-config`, libffi/zlib development headers, `xz`, `curl`, `dpkg-deb`, `jq`, and `uv`. Historical reference bindings build a checksum-pinned Python 2.7.18 interpreter; newer references use Python 3.10. These are test dependencies only. Each release gets an isolated cluster. An individual persisted-data upgrade test covers concurrent transactions, watches, and snapshot conflicts while retaining the database handle:
 
 ```sh
 FDB_UPGRADE_FROM=/path/to/fdb-7.3 FDB_UPGRADE_TO=/path/to/fdb-7.4 \
@@ -119,11 +140,11 @@ FDB_UPGRADE_FROM=/path/to/fdb-7.3 FDB_UPGRADE_TO=/path/to/fdb-7.4 \
 
 Each upgrade path is an SDK root containing `bin/fdbserver` and `bin/fdbcli`; the test creates its own clusters.
 
-- [`scripts/fetch-fdb.sh`](scripts/fetch-fdb.sh) downloads matching binaries and sources for macOS arm64 (default 7.4.8). For a side-by-side 7.3 installation: `FDB_ROOT=target/fdb-7.3.81 scripts/fetch-fdb.sh 7.3.81`.
+- [`scripts/fetch-fdb.sh`](scripts/fetch-fdb.sh) downloads checksum-pinned binaries and sources (default 7.4.8). Linux amd64 supports the entire matrix; older releases have no native macOS arm64 SDK. Use `FDB_ROOT=target/versions/6.3.25 scripts/fetch-fdb.sh 6.3.25` for an isolated installation.
 - [`scripts/cluster.sh`](scripts/cluster.sh) manages a local test cluster.
 - [`scripts/bindingtester.sh quick`](scripts/bindingtester.sh) runs the reference-binding checks and requires `uv`. It uses a private cluster by default. **These tests clear the database; never use a shared cluster.**
 
-Scripts default to `target/fdb`. Set `FDB_ROOT` for fetching, reference tests, and benchmark builds; set `FDB_BIN=$FDB_ROOT/bin` for `cluster.sh`. `FDB_SOURCE_DIR` and `FDB_CLIENT_LIB` can override the matching reference sources and library. Reference tests and C benchmarks select the installed SDK's supported API version automatically.
+SDK scripts default to `target/fdb`; the matrix runner uses `target/versions/<release>`. Set `FDB_ROOT` for fetching, reference tests, and benchmark builds; set `FDB_BIN=$FDB_ROOT/bin` for `cluster.sh`. `FDB_SOURCE_DIR` and `FDB_CLIENT_LIB` can override the matching reference sources and library. Reference tests and C benchmarks select the installed SDK's supported API version automatically.
 
 ## License
 

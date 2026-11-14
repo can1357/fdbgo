@@ -118,7 +118,11 @@ func TestIntegrationReadVersionAndStatus(t *testing.T) {
 		}
 		f.Close()
 	}
-	if db.ClusterNow().ClusterID == (wire.UID{}) {
+	if db.ClusterNow().Protocol.Normalized() < wire.Protocol72 {
+		if id, err := db.ClusterID(ctx); err != fdberr.UnsupportedOperation || id.IsValid() {
+			t.Fatalf("legacy cluster ID = %v, %v; want unsupported_operation", id, err)
+		}
+	} else if db.ClusterNow().ClusterID == (wire.UID{}) {
 		t.Fatal("cluster id unknown after a read version")
 	}
 	if _, ok := db.Coordinator(); !ok {
@@ -213,7 +217,11 @@ func TestIntegrationSetGetRange(t *testing.T) {
 		t.Fatalf("estimated size: %d %v", size, err)
 	}
 	pts, err := r.RangeSplitPoints(ctx, prefix, end, 1000)
-	if err != nil || len(pts) < 2 || !bytes.Equal(pts[0], prefix) || !bytes.Equal(pts[len(pts)-1], end) {
+	if db.ClusterNow().Protocol.Normalized() < wire.Protocol70.Normalized() {
+		if err != fdberr.UnsupportedOperation {
+			t.Fatalf("legacy split points = %q, %v; want unsupported_operation", pts, err)
+		}
+	} else if err != nil || len(pts) < 2 || !bytes.Equal(pts[0], prefix) || !bytes.Equal(pts[len(pts)-1], end) {
 		t.Fatalf("split points: %q %v", pts, err)
 	}
 	if len(db.KnownStorageServers()) == 0 {
@@ -277,7 +285,12 @@ func TestIntegrationCommitConflict(t *testing.T) {
 	if err := commitPlan(ctx, db, setPlan(x, []byte("2"))); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Commit(plan); err != fdberr.NotCommitted {
+	if err := b.Commit(plan); db.ClusterNow().Protocol.Normalized() < wire.Protocol63.Normalized() {
+		if err != fdberr.UnsupportedOperation {
+			t.Fatalf("legacy conflicting-key report = %v; want unsupported_operation", err)
+		}
+		return
+	} else if err != fdberr.NotCommitted {
 		t.Fatalf("commit: %v", err)
 	}
 	ranges, ok := b.Shared.Conflicting()

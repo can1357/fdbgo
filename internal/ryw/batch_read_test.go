@@ -86,7 +86,7 @@ func TestGetManyPinsLocalWritesAndDependentDuplicates(t *testing.T) {
 	r := newRyw()
 	defer r.Cancel()
 	r.Set([]byte("local"), []byte("before"))
-	r.AtomicOp([]byte("dependent"), []byte("-first"), MutationAppendIfFits, 0, false)
+	r.AtomicOp([]byte("dependent"), []byte("-first"), MutationAppendIfFits, AtomicOptions{})
 	key := []byte("a")
 	_, wait, err := r.GetMany(db, [][]byte{key, []byte("dependent"), []byte("local"), []byte("dependent")}, false)
 	if err != nil || wait == nil || db.starts != 3 || db.batchCalls != 0 {
@@ -95,7 +95,7 @@ func TestGetManyPinsLocalWritesAndDependentDuplicates(t *testing.T) {
 	key[0] = 'z'
 	r.Set([]byte("a"), []byte("later"))
 	r.Set([]byte("local"), []byte("after"))
-	r.AtomicOp([]byte("dependent"), []byte("-later"), MutationAppendIfFits, 0, false)
+	r.AtomicOp([]byte("dependent"), []byte("-later"), MutationAppendIfFits, AtomicOptions{})
 	values, err := wait(t.Context())
 	eqErr(t, err, nil)
 	if len(values) != 4 || string(values[0]) != "stored" || string(values[1]) != "base-first" || string(values[2]) != "before" || string(values[3]) != "base-first" {
@@ -115,7 +115,7 @@ func TestGetManySnapshotWithoutRYW(t *testing.T) {
 	r := New(NewRywOptions(0))
 	defer r.Cancel()
 	r.Set([]byte("a"), []byte("local"))
-	r.AtomicOp([]byte("dependent"), []byte("-local"), MutationAppendIfFits, 0, false)
+	r.AtomicOp([]byte("dependent"), []byte("-local"), MutationAppendIfFits, AtomicOptions{})
 	values := must(t, capture(r.GetMany(db, [][]byte{[]byte("a"), []byte("dependent")}, true)))
 	if len(values) != 2 || string(values[0]) != "stored" || string(values[1]) != "base" || db.batchCalls != 1 || db.scalarCalls != 0 {
 		t.Fatalf("snapshot without RYW = %q, batches %d, scalar reads %d", values, db.batchCalls, db.scalarCalls)
@@ -195,7 +195,7 @@ func TestGetManyCancellationDrainsEveryPlan(t *testing.T) {
 					db := &batchReadDB{fakeDB: held, entered: make(chan struct{}), exited: make(chan struct{})}
 					r := newRyw()
 					defer r.Cancel()
-					r.AtomicOp([]byte("dependent"), []byte("-local"), MutationAppendIfFits, 0, false)
+					r.AtomicOp([]byte("dependent"), []byte("-local"), MutationAppendIfFits, AtomicOptions{})
 					_, wait, err := r.GetMany(db, [][]byte{[]byte("a"), []byte("dependent"), []byte("a")}, false)
 					if wait == nil || err != nil {
 						t.Fatalf("capture: pending %v, error %v", wait != nil, err)
